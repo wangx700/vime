@@ -28,7 +28,7 @@ diff --git a/vllm/utils/local_checkpoint.py b/vllm/utils/local_checkpoint.py
 new file mode 100644
 --- /dev/null
 +++ b/vllm/utils/local_checkpoint.py
-@@ -0,0 +1,240 @@
+@@ -0,0 +1,328 @@
 +# SPDX-License-Identifier: Apache-2.0
 +"""Maintain a host-local HF checkpoint from full and delta weight versions."""
 +
@@ -39,11 +39,13 @@ new file mode 100644
 +import importlib
 +import io
 +import json
++import logging
 +import mmap
 +import os
 +import shutil
 +import struct
 +import threading
++import time
 +import zlib
 +from concurrent.futures import ThreadPoolExecutor
 +from contextlib import ExitStack, contextmanager
@@ -51,16 +53,39 @@ new file mode 100644
 +import numpy as np
 +import zstandard
 +
-+NUM_WORKERS = min(32, os.cpu_count() or 8)
++NUM_WORKERS = int(os.environ.get("VIME_DELTA_DECODE_WORKERS", min(8, os.cpu_count() or 8)))
 +SYNC_DIR = ".weight_sync"
++logger = logging.getLogger(__name__)
 +
 +
 +def pull_checkpoint(local_checkpoint_dir, base_dir, source_dir, target_version, pre_read_hook=None):
 +    """Bring a host-local checkpoint to a published full or delta version."""
++    started = time.perf_counter()
++    timings = {
++        "perf/update_weights_delta_decode_pre_read_hook_time": 0.0,
++        "perf/update_weights_delta_decode_lock_wait_time": 0.0,
++        "perf/update_weights_delta_decode_plan_time": 0.0,
++        "perf/update_weights_delta_decode_reset_time": 0.0,
++        "perf/update_weights_delta_decode_metadata_time": 0.0,
++        "perf/update_weights_delta_decode_locations_time": 0.0,
++        "perf/update_weights_delta_decode_delta_read_time": 0.0,
++        "perf/update_weights_delta_decode_apply_wall_time": 0.0,
++        "perf/update_weights_delta_decode_decompress_cpu_time": 0.0,
++        "perf/update_weights_delta_decode_xor_cpu_time": 0.0,
++        "perf/update_weights_delta_decode_checksum_cpu_time": 0.0,
++        "perf/update_weights_delta_decode_mmap_close_time": 0.0,
++        "perf/update_weights_delta_decode_state_write_time": 0.0,
++        "perf/update_weights_delta_decode_versions_applied": 0.0,
++    }
 +    if target_version > 0 and pre_read_hook:
++        hook_started = time.perf_counter()
 +        module_path, _, function_name = pre_read_hook.rpartition(".")
 +        getattr(importlib.import_module(module_path), function_name)(source_dir, target_version)
++        timings["perf/update_weights_delta_decode_pre_read_hook_time"] = time.perf_counter() - hook_started
++    lock_started = time.perf_counter()
 +    with _pull_lock(local_checkpoint_dir):
++        timings["perf/update_weights_delta_decode_lock_wait_time"] = time.perf_counter() - lock_started
++        plan_started = time.perf_counter()
 +        incomplete = os.path.join(local_checkpoint_dir, SYNC_DIR, "incomplete")
 +        # Deltas update mmap'ed safetensor regions in place. A failed apply can
 +        # therefore leave bytes changed even though state.json was not advanced;
@@ -73,19 +98,28 @@ new file mode 100644
 +        start = target_version
 +        while start > floor and _is_delta(_version_dir(source_dir, start)):
 +            start -= 1
++        timings["perf/update_weights_delta_decode_plan_time"] = time.perf_counter() - plan_started
 +        if applied is None or applied > target_version or start > applied:
++            reset_started = time.perf_counter()
 +            _reset_checkpoint(base_dir if start == 0 else _version_dir(source_dir, start), local_checkpoint_dir, start)
++            timings["perf/update_weights_delta_decode_reset_time"] = time.perf_counter() - reset_started
 +        else:
 +            start = applied
 +        try:
 +            for version in range(start + 1, target_version + 1):
 +                open(incomplete, "a").close()
-+                _apply_delta(local_checkpoint_dir, _version_dir(source_dir, version))
++                applied_timings = _apply_delta(local_checkpoint_dir, _version_dir(source_dir, version))
++                for name, elapsed in applied_timings.items():
++                    timings[name] += elapsed
++                timings["perf/update_weights_delta_decode_versions_applied"] += 1
 +        except BaseException:
 +            raise
 +        else:
 +            if os.path.exists(incomplete):
 +                os.remove(incomplete)
++    timings["perf/update_weights_delta_decode_total_time"] = time.perf_counter() - started
++    logger.info("[local checkpoint timings target=%s] %s", target_version, timings)
++    return timings
 +
 +
 +def _version_dir(source_dir, version):
@@ -191,21 +225,37 @@ new file mode 100644
 +
 +
 +def _apply_delta(local_checkpoint_dir, version_dir):
++    metadata_started = time.perf_counter()
 +    with open(os.path.join(version_dir, "model.safetensors.index.json")) as index_file:
 +        metadata = json.load(index_file)["metadata"]
 +    applied = _read_applied_version(local_checkpoint_dir)
 +    version = int(metadata["version"])
 +    if applied == version:
-+        return
++        return {
++            "perf/update_weights_delta_decode_metadata_time": time.perf_counter() - metadata_started,
++            "perf/update_weights_delta_decode_locations_time": 0.0,
++            "perf/update_weights_delta_decode_delta_read_time": 0.0,
++            "perf/update_weights_delta_decode_apply_wall_time": 0.0,
++            "perf/update_weights_delta_decode_decompress_cpu_time": 0.0,
++            "perf/update_weights_delta_decode_xor_cpu_time": 0.0,
++            "perf/update_weights_delta_decode_checksum_cpu_time": 0.0,
++            "perf/update_weights_delta_decode_mmap_close_time": 0.0,
++            "perf/update_weights_delta_decode_state_write_time": 0.0,
++        }
 +    if applied != int(metadata["base_version"]):
 +        raise RuntimeError(f"Out-of-order delta: local at {applied}, delta builds on {metadata['base_version']}")
 +    if metadata["compression_format"] != "zstd":
 +        raise NotImplementedError(f"Unsupported compression {metadata['compression_format']!r}")
 +
++    metadata_time = time.perf_counter() - metadata_started
++    locations_started = time.perf_counter()
 +    locations = _tensor_locations(local_checkpoint_dir)
++    locations_time = time.perf_counter() - locations_started
 +    resources, mapped_files, items, mismatches = ExitStack(), {}, [], []
 +    mismatch_lock = threading.Lock()
++    mmap_close_time = 0.0
 +    try:
++        delta_read_started = time.perf_counter()
 +        for delta_path in sorted(glob.glob(os.path.join(version_dir, "*.safetensors"))):
 +            with open(delta_path, "rb") as tensor_file:
 +                blob = tensor_file.read()
@@ -223,6 +273,7 @@ new file mode 100644
 +                    mapped_files[path] = resources.enter_context(_writable_mmap(path))
 +                begin, end = info["data_offsets"]
 +                items.append((name, memoryview(blob)[data_start + begin : data_start + end], path, offset, byte_count, metadata_checksums.get(name)))
++        delta_read_time = time.perf_counter() - delta_read_started
 +
 +        def mismatch(name):
 +            with mismatch_lock:
@@ -231,30 +282,72 @@ new file mode 100644
 +        def apply_xor(item):
 +            name, compressed, path, offset, byte_count, expected = item
 +            region = np.ndarray((byte_count,), dtype=np.uint8, buffer=mapped_files[path], offset=offset)
-+            reader, position, hasher = zstandard.ZstdDecompressor().stream_reader(io.BytesIO(bytes(compressed))), 0, _new_hasher(metadata["checksum_format"])
++            decompress_time = 0.0
++            xor_time = 0.0
++            checksum_time = 0.0
++            checksum_scope = metadata.get("checksum_scope", "materialized_tensor")
++            if checksum_scope == "compressed_delta":
++                checksum_started = time.perf_counter()
++                hasher = _new_hasher(metadata["checksum_format"])
++                hasher.update(compressed)
++                checksum_time += time.perf_counter() - checksum_started
++                if hasher.hexdigest() != expected:
++                    mismatch(name)
++                    return decompress_time, xor_time, checksum_time
++            decompress_started = time.perf_counter()
++            reader = zstandard.ZstdDecompressor().stream_reader(io.BytesIO(bytes(compressed)))
++            decompress_time += time.perf_counter() - decompress_started
++            position = 0
++            hasher = None if checksum_scope == "compressed_delta" else _new_hasher(metadata["checksum_format"])
 +            while position < byte_count:
++                decompress_started = time.perf_counter()
 +                block = reader.read(min(2 << 20, byte_count - position))
++                decompress_time += time.perf_counter() - decompress_started
 +                if not block:
 +                    break
 +                chunk = np.frombuffer(block, dtype=np.uint8)
++                xor_started = time.perf_counter()
 +                region[position : position + chunk.size] ^= chunk
-+                hasher.update(region[position : position + chunk.size])
++                xor_time += time.perf_counter() - xor_started
++                if hasher is not None:
++                    checksum_started = time.perf_counter()
++                    hasher.update(region[position : position + chunk.size])
++                    checksum_time += time.perf_counter() - checksum_started
 +                position += chunk.size
-+            if position != byte_count or hasher.hexdigest() != expected:
++            if position != byte_count or (hasher is not None and hasher.hexdigest() != expected):
 +                mismatch(name)
++            return decompress_time, xor_time, checksum_time
 +
 +        def apply_overwrite(item):
 +            name, compressed, path, offset, byte_count, expected = item
++            checksum_scope = metadata.get("checksum_scope", "materialized_tensor")
++            checksum_time = 0.0
++            if checksum_scope == "compressed_delta":
++                checksum_started = time.perf_counter()
++                hasher = _new_hasher(metadata["checksum_format"])
++                hasher.update(compressed)
++                checksum_time += time.perf_counter() - checksum_started
++                if hasher.hexdigest() != expected:
++                    mismatch(name)
++                    return 0.0, 0.0, checksum_time
++            decompress_started = time.perf_counter()
 +            delta = np.frombuffer(zstandard.ZstdDecompressor().decompress(bytes(compressed)), dtype=np.uint8)
++            decompress_time = time.perf_counter() - decompress_started
 +            count = int.from_bytes(delta[:4].tobytes(), "little")
 +            positions_end = 4 + 4 * count
 +            positions = np.frombuffer(delta[4:positions_end].tobytes(), dtype="<u4")
 +            region = np.ndarray((byte_count,), dtype=np.uint8, buffer=mapped_files[path], offset=offset)
++            xor_started = time.perf_counter()
 +            region[positions] = delta[positions_end:]
-+            hasher = _new_hasher(metadata["checksum_format"])
-+            hasher.update(region)
-+            if hasher.hexdigest() != expected:
-+                mismatch(name)
++            xor_time = time.perf_counter() - xor_started
++            if checksum_scope != "compressed_delta":
++                hasher = _new_hasher(metadata["checksum_format"])
++                checksum_started = time.perf_counter()
++                hasher.update(region)
++                checksum_time += time.perf_counter() - checksum_started
++                if hasher.hexdigest() != expected:
++                    mismatch(name)
++            return decompress_time, xor_time, checksum_time
 +
 +        if metadata["delta_encoding"] == "xor":
 +            apply = apply_xor
@@ -262,10 +355,27 @@ new file mode 100644
 +            apply = apply_overwrite
 +        else:
 +            raise NotImplementedError(f"Unsupported delta encoding {metadata['delta_encoding']!r}")
++        apply_started = time.perf_counter()
 +        with ThreadPoolExecutor(max_workers=NUM_WORKERS) as executor:
-+            list(executor.map(apply, items))
++            worker_timings = list(executor.map(apply, items))
++        apply_wall_time = time.perf_counter() - apply_started
 +    finally:
++        mmap_close_started = time.perf_counter()
 +        resources.close()
++        mmap_close_time = time.perf_counter() - mmap_close_started
 +    if mismatches:
 +        raise RuntimeError(f"Checksum mismatch for {len(mismatches)} tensors after applying {version_dir}: {sorted(mismatches)[:20]}")
++    state_write_started = time.perf_counter()
 +    _write_applied_version(local_checkpoint_dir, version)
++    state_write_time = time.perf_counter() - state_write_started
++    return {
++        "perf/update_weights_delta_decode_metadata_time": metadata_time,
++        "perf/update_weights_delta_decode_locations_time": locations_time,
++        "perf/update_weights_delta_decode_delta_read_time": delta_read_time,
++        "perf/update_weights_delta_decode_apply_wall_time": apply_wall_time,
++        "perf/update_weights_delta_decode_decompress_cpu_time": sum(value[0] for value in worker_timings),
++        "perf/update_weights_delta_decode_xor_cpu_time": sum(value[1] for value in worker_timings),
++        "perf/update_weights_delta_decode_checksum_cpu_time": sum(value[2] for value in worker_timings),
++        "perf/update_weights_delta_decode_mmap_close_time": mmap_close_time,
++        "perf/update_weights_delta_decode_state_write_time": state_write_time,
++    }

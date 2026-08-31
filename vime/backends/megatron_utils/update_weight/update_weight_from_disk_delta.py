@@ -113,7 +113,7 @@ class UpdateWeightFromDiskDelta:
             try:
                 self._snapshot[name] = read_hf(name)
             except KeyError:
-                self._snapshot[name] = _tensor_bytes(tensor)
+                self._snapshot[name] = _tensor_bytes(tensor)[0]
                 logger.warning("delta baseline: %s absent from hf_checkpoint; using current converted weight", name)
 
         if dist.get_rank() == 0:
@@ -147,6 +147,22 @@ class UpdateWeightFromDiskDelta:
         self.changed_bytes = 0
         self.total_bytes = 0
         self.wire_bytes = 0
+        self._stage_metrics.update(
+            {
+                "perf/update_weights_delta_buffer_pool_time": 0.0,
+                "perf/update_weights_delta_hf_conversion_time": 0.0,
+                "perf/update_weights_delta_tensor_copy_time": 0.0,
+                "perf/update_weights_delta_xor_cpu_time": 0.0,
+                "perf/update_weights_delta_nonzero_cpu_time": 0.0,
+                "perf/update_weights_delta_compress_cpu_time": 0.0,
+                "perf/update_weights_delta_checksum_cpu_time": 0.0,
+                "perf/update_weights_delta_worker_cpu_time": 0.0,
+                "perf/update_weights_delta_worker_wait_time": 0.0,
+                "perf/update_weights_delta_serialize_time": 0.0,
+                "perf/update_weights_delta_data_write_time": 0.0,
+                "perf/update_weights_delta_index_write_time": 0.0,
+            }
+        )
 
         if dist.get_rank() != 0:
             # Do not return: every rank must execute the conversion iterator's collectives.
@@ -155,6 +171,7 @@ class UpdateWeightFromDiskDelta:
             return
 
         os.makedirs(self._version_dir, exist_ok=True)
+        buffer_pool_started = time.perf_counter()
         max_bytes = max((value.nbytes for value in self._snapshot.values()), default=0)
         free_buffers: queue.Queue[torch.Tensor] = queue.Queue()
         use_pinned = max_bytes > 0
@@ -166,39 +183,124 @@ class UpdateWeightFromDiskDelta:
             except RuntimeError as exc:
                 logger.warning("Pinned host buffers unavailable (%s); using pageable copies", exc)
                 use_pinned = False
+        self._stage_metrics["perf/update_weights_delta_buffer_pool_time"] = (
+            time.perf_counter() - buffer_pool_started
+        )
 
-        def diff_and_compress(name: str, new: np.ndarray) -> tuple[str, np.ndarray, np.ndarray | None, str | None, int]:
+        def diff_and_compress(
+            name: str, new: np.ndarray, leased_buffer: torch.Tensor | None
+        ) -> tuple[str, np.ndarray, np.ndarray | None, str | None, int, dict[str, float]]:
             old = self._snapshot[name]
-            if new.nbytes != old.nbytes:
-                raise ValueError(f"Delta tensor size changed for {name}: {old.nbytes} != {new.nbytes}")
-            if self.delta_encoding == "xor":
-                diff = new ^ old
-                changed = int(np.count_nonzero(diff))
-            else:
-                mask = new != old
-                changed = int(np.count_nonzero(mask))
-                diff = overwrite_encode(new, mask)
-            if not changed:
-                return name, new, None, None, 0
-            compressed = np.frombuffer(zstandard.ZstdCompressor(level=1).compress(diff), dtype=np.uint8)
-            return name, new, compressed, checksum(self.checksum_algorithm, new), changed
+            try:
+                if new.nbytes != old.nbytes:
+                    raise ValueError(f"Delta tensor size changed for {name}: {old.nbytes} != {new.nbytes}")
+                diff_started = time.perf_counter()
+                if self.delta_encoding == "xor":
+                    diff = new ^ old
+                    diff_finished = time.perf_counter()
+                    nonzero_started = diff_finished
+                    changed = int(np.count_nonzero(diff))
+                else:
+                    mask = new != old
+                    diff_finished = time.perf_counter()
+                    nonzero_started = diff_finished
+                    changed = int(np.count_nonzero(mask))
+                    diff = overwrite_encode(new, mask)
+                nonzero_finished = time.perf_counter()
+                timings = {
+                    "perf/update_weights_delta_xor_cpu_time": diff_finished - diff_started,
+                    "perf/update_weights_delta_nonzero_cpu_time": nonzero_finished - nonzero_started,
+                    "perf/update_weights_delta_compress_cpu_time": 0.0,
+                    "perf/update_weights_delta_checksum_cpu_time": 0.0,
+                }
+                compressed = None
+                digest = None
+                if changed:
+                    compress_started = time.perf_counter()
+                    compressed = np.frombuffer(
+                        zstandard.ZstdCompressor(level=1).compress(diff), dtype=np.uint8
+                    )
+                    timings["perf/update_weights_delta_compress_cpu_time"] = (
+                        time.perf_counter() - compress_started
+                    )
+                    # The version chain already proves which base is being patched.
+                    # Hash the wire representation so corruption is still detected
+                    # without another full-model pass over the materialized tensor.
+                    checksum_started = time.perf_counter()
+                    digest = checksum(self.checksum_algorithm, compressed)
+                    timings["perf/update_weights_delta_checksum_cpu_time"] = (
+                        time.perf_counter() - checksum_started
+                    )
+
+                if leased_buffer is not None:
+                    # Keep the NPU-to-host copy leased until the worker is done.
+                    # Moving the unavoidable snapshot copy here overlaps it with
+                    # conversion and compression of neighbouring tensors.
+                    if old.flags.writeable:
+                        np.copyto(old, new)
+                        new = old
+                    else:
+                        new = new.copy()
+                return name, new, compressed, digest, changed, timings
+            finally:
+                if leased_buffer is not None:
+                    free_buffers.put(leased_buffer)
 
         pool = ThreadPoolExecutor(max_workers=NUM_WORKERS)
         inflight: deque = deque()
         try:
-            for name, tensor in self._iter_hf_tensors(progress_desc="Encode disk delta"):
-                new = _tensor_bytes(tensor, free_buffers=free_buffers if use_pinned else None)
+            tensor_iterator = iter(self._iter_hf_tensors(progress_desc="Encode disk delta"))
+            while True:
+                conversion_started = time.perf_counter()
+                try:
+                    name, tensor = next(tensor_iterator)
+                except StopIteration:
+                    self._stage_metrics["perf/update_weights_delta_hf_conversion_time"] += (
+                        time.perf_counter() - conversion_started
+                    )
+                    break
+                self._stage_metrics["perf/update_weights_delta_hf_conversion_time"] += (
+                    time.perf_counter() - conversion_started
+                )
+                copy_started = time.perf_counter()
+                new, leased_buffer = _tensor_bytes(
+                    tensor,
+                    free_buffers=free_buffers if use_pinned else None,
+                    lease_buffer=use_pinned,
+                )
+                self._stage_metrics["perf/update_weights_delta_tensor_copy_time"] += (
+                    time.perf_counter() - copy_started
+                )
                 self.total_bytes += new.nbytes
-                inflight.append(pool.submit(diff_and_compress, name, new))
+                inflight.append(pool.submit(diff_and_compress, name, new, leased_buffer))
                 if len(inflight) >= 2 * NUM_WORKERS:
+                    wait_started = time.perf_counter()
                     self._collect_encoded(inflight.popleft())
+                    self._stage_metrics["perf/update_weights_delta_worker_wait_time"] += (
+                        time.perf_counter() - wait_started
+                    )
             while inflight:
+                wait_started = time.perf_counter()
                 self._collect_encoded(inflight.popleft())
+                self._stage_metrics["perf/update_weights_delta_worker_wait_time"] += (
+                    time.perf_counter() - wait_started
+                )
         finally:
             pool.shutdown()
+        self._stage_metrics["perf/update_weights_delta_worker_cpu_time"] = sum(
+            self._stage_metrics[name]
+            for name in (
+                "perf/update_weights_delta_xor_cpu_time",
+                "perf/update_weights_delta_nonzero_cpu_time",
+                "perf/update_weights_delta_compress_cpu_time",
+                "perf/update_weights_delta_checksum_cpu_time",
+            )
+        )
 
     def _collect_encoded(self, future) -> None:
-        name, new, compressed, digest, changed = future.result()
+        name, new, compressed, digest, changed, timings = future.result()
+        for metric, elapsed in timings.items():
+            self._stage_metrics[metric] += elapsed
         self._snapshot[name] = new
         if changed:
             self.changed_bytes += changed
@@ -209,9 +311,17 @@ class UpdateWeightFromDiskDelta:
     def _write_delta_files(self) -> None:
         if self._delta:
             filename = "model-00000-of-00001.safetensors"
+            serialize_started = time.perf_counter()
             blob = safetensors.numpy.save(self._delta, metadata=self._checksums)
+            self._stage_metrics["perf/update_weights_delta_serialize_time"] = (
+                time.perf_counter() - serialize_started
+            )
             self.wire_bytes = len(blob)
+            data_write_started = time.perf_counter()
             _atomic_write(os.path.join(self._version_dir, filename), blob)
+            self._stage_metrics["perf/update_weights_delta_data_write_time"] = (
+                time.perf_counter() - data_write_started
+            )
         else:
             filename = None
         index = {
@@ -221,12 +331,17 @@ class UpdateWeightFromDiskDelta:
                 "delta_encoding": self.delta_encoding,
                 "compression_format": "zstd",
                 "checksum_format": self.checksum_algorithm,
+                "checksum_scope": "compressed_delta",
             },
             "weight_map": {name: filename for name in self._delta},
         }
+        index_write_started = time.perf_counter()
         _atomic_write(
             os.path.join(self._version_dir, "model.safetensors.index.json"),
             json.dumps(index).encode(),
+        )
+        self._stage_metrics["perf/update_weights_delta_index_write_time"] = (
+            time.perf_counter() - index_write_started
         )
 
     def _reload_engines(self) -> None:
@@ -282,12 +397,17 @@ class UpdateWeightFromDiskDelta:
             logger.info("[disk delta v=%s] density=%.2f%% wire=%.2f GB", self.weight_version, 100 * changed / max(total, 1), wire / 1e9)
 
 
-def _tensor_bytes(tensor: torch.Tensor, *, free_buffers: queue.Queue[torch.Tensor] | None = None) -> np.ndarray:
+def _tensor_bytes(
+    tensor: torch.Tensor,
+    *,
+    free_buffers: queue.Queue[torch.Tensor] | None = None,
+    lease_buffer: bool = False,
+) -> tuple[np.ndarray, torch.Tensor | None]:
     flat = tensor.detach().contiguous().view(torch.uint8).reshape(-1)
     if flat.device.type == "cpu":
-        return flat.numpy().copy()
+        return flat.numpy().copy(), None
     if free_buffers is None:
-        return flat.cpu().numpy().copy()
+        return flat.cpu().numpy().copy(), None
 
     buffer = free_buffers.get()
     try:
@@ -296,9 +416,12 @@ def _tensor_bytes(tensor: torch.Tensor, *, free_buffers: queue.Queue[torch.Tenso
             torch.npu.current_stream().synchronize()
         elif flat.device.type == "cuda":
             torch.cuda.current_stream().synchronize()
-        return buffer[: flat.numel()].numpy().copy()
+        if lease_buffer:
+            return buffer[: flat.numel()].numpy(), buffer
+        return buffer[: flat.numel()].numpy().copy(), None
     finally:
-        free_buffers.put(buffer)
+        if not lease_buffer:
+            free_buffers.put(buffer)
 
 
 def _metric_device() -> torch.device:

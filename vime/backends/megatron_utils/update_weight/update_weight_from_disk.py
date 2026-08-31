@@ -82,7 +82,11 @@ class UpdateWeightFromDisk:
         version_dir = Path(self.args.update_weight_disk_dir) / f"weight_v{self.weight_version:06d}"
         started = time.perf_counter()
 
+        prepare_started = time.perf_counter()
         self._prepare_version_dir(version_dir)
+        self.update_weight_metrics["perf/update_weights_full_prepare_time"] = (
+            time.perf_counter() - prepare_started
+        )
         write_started = time.perf_counter()
         self._write_full_checkpoint(version_dir)
         dist.barrier(group=get_gloo_group())
@@ -140,15 +144,28 @@ class UpdateWeightFromDisk:
         weight_map: dict[str, str] = {}
         total_size = 0
         shard_files: list[str] = []
+        hf_conversion_time = 0.0
+        tensor_prepare_time = 0.0
+        safetensors_save_time = 0.0
 
-        for chunk_index, chunk in enumerate(
+        chunk_iterator = iter(
             self._iterator.get_hf_weight_chunks(
                 self.weights_getter(), progress_desc="Save full disk checkpoint"
-            ),
-            start=1,
-        ):
+            )
+        )
+        chunk_index = 0
+        while True:
+            conversion_started = time.perf_counter()
+            try:
+                chunk = next(chunk_iterator)
+            except StopIteration:
+                hf_conversion_time += time.perf_counter() - conversion_started
+                break
+            hf_conversion_time += time.perf_counter() - conversion_started
+            chunk_index += 1
             if not is_writer:
                 continue
+            tensor_prepare_started = time.perf_counter()
             state_dict: dict[str, torch.Tensor] = {}
             for name, tensor in chunk:
                 if name in weight_map or name in state_dict:
@@ -160,14 +177,18 @@ class UpdateWeightFromDisk:
                     tensor = tensor.cpu()
                 state_dict[name] = tensor
                 total_size += tensor.numel() * tensor.element_size()
+            tensor_prepare_time += time.perf_counter() - tensor_prepare_started
             if not state_dict:
                 continue
             filename = f"model-{chunk_index:05d}.safetensors"
+            save_started = time.perf_counter()
             save_file(state_dict, version_dir / filename, metadata={"format": "pt"})
+            safetensors_save_time += time.perf_counter() - save_started
             shard_files.append(filename)
             weight_map.update({name: filename for name in state_dict})
 
         if is_writer:
+            index_started = time.perf_counter()
             if not shard_files:
                 raise ValueError("No HF tensors were produced for full disk checkpoint")
             rename_map: dict[str, str] = {}
@@ -187,6 +208,14 @@ class UpdateWeightFromDisk:
                 output.flush()
                 os.fsync(output.fileno())
             os.replace(temporary, index_path)
+            self.update_weight_metrics.update(
+                {
+                    "perf/update_weights_full_hf_conversion_time": hf_conversion_time,
+                    "perf/update_weights_full_tensor_prepare_time": tensor_prepare_time,
+                    "perf/update_weights_full_safetensors_save_time": safetensors_save_time,
+                    "perf/update_weights_full_index_write_time": time.perf_counter() - index_started,
+                }
+            )
 
 
 def _is_hf_weight_file(path: Path) -> bool:
