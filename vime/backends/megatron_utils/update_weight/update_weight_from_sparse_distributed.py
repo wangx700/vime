@@ -12,9 +12,14 @@ import torch
 import torch.distributed as dist
 from megatron.core import mpu
 from ray.actor import ActorHandle
-from vllm_ascend.distributed.weight_transfer.hccl_engine import HCCLTrainerSendWeightsArgs
-from vllm_ascend.distributed.weight_transfer.sparse_hccl_engine import SparseHCCLWeightTransferEngine
-from vllm_ascend.distributed.weight_transfer.sparse_weight_patch import SparseWeightPatch
+from vllm_ascend.distributed.weight_transfer.sparse_hccl_engine import (
+    SparseHCCLTrainerSendWeightsArgs,
+    SparseHCCLWeightTransferEngine,
+)
+from vllm_ascend.distributed.weight_transfer.sparse_weight_patch import (
+    SparseWeightPatch,
+    partition_qwen3_sparse_patches,
+)
 
 from vime.utils import megatron_bridge_utils
 from vime.utils.distributed_utils import get_gloo_group
@@ -154,6 +159,10 @@ class UpdateWeightFromSparseDistributed:
         del engine_gpu_offsets
         self.rollout_engines = list(rollout_engines)
         self.rollout_engine_lock = rollout_engine_lock
+        self._rollout_tp_sizes = list(
+            engine_gpu_counts
+            or [self.args.rollout_num_gpus_per_engine] * len(rollout_engines)
+        )
         if self._is_src_rank:
             self._model_update_groups = connect_rollout_engines_from_distributed(
                 self.args, self._group_name, self.rollout_engines, engine_gpu_counts=engine_gpu_counts
@@ -414,6 +423,16 @@ class UpdateWeightFromSparseDistributed:
         weight_version: int,
     ) -> None:
         patches = [patch for patch, _shape in patches_with_shapes]
+        rank_patches = partition_qwen3_sparse_patches(
+            list(patches_with_shapes),
+            self._rollout_tp_sizes,
+            num_attention_heads=self.args.num_attention_heads,
+            num_key_value_heads=self.args.num_query_groups,
+        )
+        rank_num_updates_lists = [
+            [patch.indices.numel() for patch in worker_patches]
+            for worker_patches in rank_patches
+        ]
         while not ray.get(self.rollout_engine_lock.acquire.remote()):
             time.sleep(0.1)
         try:
@@ -423,13 +442,19 @@ class UpdateWeightFromSparseDistributed:
                     dtypes=[patch.values.dtype for patch in patches],
                     shapes=[shape for _patch, shape in patches_with_shapes],
                     num_updates_list=[patch.indices.numel() for patch in patches],
+                    rank_num_updates_lists=rank_num_updates_lists,
                     group_name=self._group_name,
                     weight_version=str(weight_version),
                 )
                 for engine in self.rollout_engines
             ]
             SparseHCCLWeightTransferEngine.trainer_send_weights(
-                iter(patches), HCCLTrainerSendWeightsArgs(group=self._model_update_groups, packed=False)
+                iter(patches),
+                SparseHCCLTrainerSendWeightsArgs(
+                    group=self._model_update_groups,
+                    packed=False,
+                    rank_patches=rank_patches,
+                ),
             )
             ray.get(refs)
         finally:

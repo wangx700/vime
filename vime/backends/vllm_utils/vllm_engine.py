@@ -960,6 +960,7 @@ class VLLMEngine(RayActor):
         shapes,
         num_updates_list,
         group_name,
+        rank_num_updates_lists=None,
         flush_cache=False,
         weight_version: str | None = None,
     ):
@@ -975,6 +976,10 @@ class VLLMEngine(RayActor):
             "shapes": [list(shape) for shape in shapes],
             "num_updates_list": list(num_updates_list),
         }
+        if rank_num_updates_lists is not None:
+            update_info["rank_num_updates_lists"] = [
+                list(counts) for counts in rank_num_updates_lists
+            ]
         return self._post_vllm_update_weights_http(update_info)
 
     def pull_weights(self, target_version: int):

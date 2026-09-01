@@ -379,6 +379,27 @@ def test_update_sparse_weights_from_distributed_posts_counts(vllm_engine, monkey
 
 
 @pytest.mark.unit
+def test_update_sparse_weights_posts_rank_specific_counts(vllm_engine, monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        vllm_engine,
+        "_post_vllm_update_weights_http",
+        lambda info: calls.append(info) or {"ok": True},
+    )
+
+    vllm_engine.update_sparse_weights_from_distributed(
+        ["model.layers.0.self_attn.q_proj.weight"],
+        [torch.bfloat16],
+        [torch.Size([8, 4])],
+        [4],
+        group_name="vime-sparse-hccl",
+        rank_num_updates_lists=[[2], [2]],
+    )
+
+    assert calls[0]["rank_num_updates_lists"] == [[2], [2]]
+
+
+@pytest.mark.unit
 def test_pull_weights_posts_collective_rpc_and_records_version(vllm_engine, monkeypatch):
     calls = []
 
