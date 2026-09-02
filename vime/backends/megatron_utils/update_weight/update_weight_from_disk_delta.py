@@ -21,6 +21,7 @@ from ray.actor import ActorHandle
 
 from vime.utils.disk_delta import NUM_WORKERS, checksum, make_tensor_reader, overwrite_encode
 from vime.utils.distributed_utils import get_gloo_group
+from vime.utils.profile_utils import should_profile_update_weight
 
 from .hf_weight_iterator_base import HfWeightIteratorBase
 
@@ -48,6 +49,7 @@ class UpdateWeightFromDiskDelta:
         self.args = args
         self.weights_getter = weights_getter
         self.weight_version = 0
+        self._update_weight_call = 0
         self.update_weight_metrics: dict[str, float] = {}
         self.rollout_engines: list[ActorHandle] = []
         self.delta_dir = args.update_weight_disk_dir
@@ -86,6 +88,7 @@ class UpdateWeightFromDiskDelta:
 
     @torch.no_grad()
     def update_weights(self) -> None:
+        self._update_weight_call += 1
         if not self._baseline_captured:
             self._capture_baseline()
             self._baseline_captured = True
@@ -108,7 +111,7 @@ class UpdateWeightFromDiskDelta:
             pulls = [engine.pull_weights.remote(target_version=0) for engine in self.rollout_engines]
         dist.barrier(group=get_gloo_group())
 
-        read_hf = make_tensor_reader(self.args.hf_checkpoint)
+        read_hf = make_tensor_reader(self.args.hf_checkpoint) # 本地HF权重？
         for name, tensor in self._iter_hf_tensors(progress_desc="Capture disk delta baseline"):
             try:
                 self._snapshot[name] = read_hf(name)
@@ -349,27 +352,38 @@ class UpdateWeightFromDiskDelta:
             self._post_write_hook(self.args, self._version_dir, self.rollout_engines)
         dist.barrier(group=get_gloo_group())
         if dist.get_rank() == 0:
+            profile_inference = should_profile_update_weight(self._update_weight_call)
+            inference_profile_started = False
+            if profile_inference:
+                ray.get([engine.start_profile.remote() for engine in self.rollout_engines])
+                inference_profile_started = True
+            # Include pull_weights: it materializes the version from the shared
+            # disk into the rollout host's local checkpoint before reload.
             started = time.perf_counter()
-            ray.get([engine.pull_weights.remote(self.weight_version) for engine in self.rollout_engines])
-            pulled = time.perf_counter()
-            ray.get([engine.pause_generation.remote() for engine in self.rollout_engines])
-            paused = time.perf_counter()
             try:
-                ray.get([engine.flush_cache.remote() for engine in self.rollout_engines])
-                flushed = time.perf_counter()
-                ray.get(
-                    [
-                        engine.update_weights_from_disk.remote(
-                            self.args.update_weight_local_checkpoint_dir,
-                            weight_version=str(self.weight_version),
-                        )
-                        for engine in self.rollout_engines
-                    ]
-                )
-                reloaded = time.perf_counter()
+                ray.get([engine.pull_weights.remote(self.weight_version) for engine in self.rollout_engines])
+                pulled = time.perf_counter()
+                ray.get([engine.pause_generation.remote() for engine in self.rollout_engines])
+                paused = time.perf_counter()
+                try:
+                    ray.get([engine.flush_cache.remote() for engine in self.rollout_engines])
+                    flushed = time.perf_counter()
+                    ray.get(
+                        [
+                            engine.update_weights_from_disk.remote(
+                                self.args.update_weight_local_checkpoint_dir,
+                                weight_version=str(self.weight_version),
+                            )
+                            for engine in self.rollout_engines
+                        ]
+                    )
+                    reloaded = time.perf_counter()
+                finally:
+                    ray.get([engine.continue_generation.remote() for engine in self.rollout_engines])
+                resumed = time.perf_counter()
             finally:
-                ray.get([engine.continue_generation.remote() for engine in self.rollout_engines])
-            resumed = time.perf_counter()
+                if inference_profile_started:
+                    ray.get([engine.stop_profile.remote() for engine in self.rollout_engines])
             self._stage_metrics.update(
                 {
                     "perf/update_weights_delta_materialize_time": pulled - started,

@@ -1,6 +1,7 @@
 import logging
 import os
 import random
+import time
 from argparse import Namespace
 from contextlib import nullcontext
 
@@ -43,7 +44,7 @@ from vime.utils.routing_replay import RoutingReplay
 from vime.utils.timer import Timer, inverse_timer, timer, with_defer
 from vime.utils.types import RolloutBatch
 
-from ...utils.profile_utils import TrainProfiler
+from ...utils.profile_utils import TrainProfiler, create_update_weight_profiler, should_profile_update_weight
 from ...utils.tensor_backper import TensorBackuper
 from .checkpoint import load_checkpoint
 from .cp_utils import slice_log_prob_with_cp, slice_with_cp
@@ -188,6 +189,7 @@ class MegatronTrainRayActor(TrainRayActor):
             model_name=type(self.hf_config).__name__.lower() if self.args.model_name is None else self.args.model_name,
             quantization_config=getattr(self.hf_config, "quantization_config", None),
         )
+        self._update_weight_profile_index = 0
 
         # empty cache after initialization
         clear_memory()
@@ -659,8 +661,37 @@ class MegatronTrainRayActor(TrainRayActor):
                 ray.get(self.rollout_manager.clear_updatable_num_new_engines.remote())
 
         with torch_memory_saver.disable() if (self.args.offload_train and not is_npu()) else nullcontext():
+            self._update_weight_profile_index += 1
+            update_call = self._update_weight_profile_index
+            profile_update = should_profile_update_weight(update_call)
+            update_name = type(self.weight_updater).__name__
+            trainer_profiler = None
+            if profile_update:
+                trainer_profiler = create_update_weight_profiler(update_name, update_call)
+                if trainer_profiler is not None:
+                    trainer_profiler.start()
+                if is_npu():
+                    torch.npu.synchronize()
+                profile_started_at = time.perf_counter()
+
             print_memory("before update_weights")
-            self.weight_updater.update_weights()
+            try:
+                with torch.profiler.record_function(update_name):
+                    self.weight_updater.update_weights()
+            finally:
+                if profile_update:
+                    if is_npu():
+                        torch.npu.synchronize()
+                    elapsed_ms = (time.perf_counter() - profile_started_at) * 1000
+                    logger.info(
+                        "UPDATE_WEIGHT_PROFILE component=trainer call=%s name=%s rank=%s elapsed_ms=%.3f",
+                        update_call,
+                        update_name,
+                        dist.get_rank(),
+                        elapsed_ms,
+                    )
+                    if trainer_profiler is not None:
+                        trainer_profiler.stop()
             print_memory("after update_weights")
 
             if self.args.ci_test and len(rollout_engines) > 0:

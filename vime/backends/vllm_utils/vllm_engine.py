@@ -11,6 +11,7 @@ from __future__ import annotations
 import base64
 import dataclasses
 import ipaddress
+import json
 import logging
 import multiprocessing
 import os
@@ -475,6 +476,23 @@ def build_vllm_cmd_and_env(server_args: dict[str, Any]) -> tuple[list[str], dict
         cmd += [
             "--worker-extension-cls",
             _ext_cls,
+        ]
+
+    update_profile_dir = os.getenv("VIME_UPDATE_WEIGHT_PROFILE_DIR")
+    if update_profile_dir and not _user_overrode(args, "vllm_profiler_config"):
+        inference_profile_dir = os.path.join(update_profile_dir, "inference")
+        os.makedirs(inference_profile_dir, exist_ok=True)
+        cmd += [
+            "--profiler-config",
+            json.dumps(
+                {
+                    "profiler": "torch",
+                    "torch_profiler_dir": inference_profile_dir,
+                    "torch_profiler_with_stack": True,
+                    "torch_profiler_record_shapes": True,
+                    "ignore_frontend": True,
+                }
+            ),
         ]
 
     worker_type = server_args.get("worker_type", "regular")

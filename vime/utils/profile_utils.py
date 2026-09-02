@@ -1,4 +1,5 @@
 import logging
+import os
 import time
 import traceback
 from pathlib import Path
@@ -8,6 +9,43 @@ import torch
 from vime.utils.memory_utils import print_memory
 
 logger = logging.getLogger(__name__)
+
+
+def create_update_weight_profiler(update_name: str, update_call: int):
+    """Create a one-shot torch-npu profile for one trainer weight update."""
+    output_root = os.getenv("VIME_UPDATE_WEIGHT_PROFILE_DIR")
+    if not output_root:
+        return None
+
+    import torch_npu
+
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    output_dir = Path(output_root) / "training" / f"call_{update_call:04d}" / f"rank_{rank}_{update_name}"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    experimental_config = torch_npu.profiler._ExperimentalConfig(
+        profiler_level=torch_npu.profiler.ProfilerLevel.Level0,
+        l2_cache=False,
+    )
+    return torch_npu.profiler.profile(
+        activities=[
+            torch_npu.profiler.ProfilerActivity.CPU,
+            torch_npu.profiler.ProfilerActivity.NPU,
+        ],
+        on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(str(output_dir)),
+        record_shapes=True,
+        with_stack=True,
+        profile_memory=False,
+        experimental_config=experimental_config,
+    )
+
+
+def should_profile_update_weight(update_call: int) -> bool:
+    if not os.getenv("VIME_UPDATE_WEIGHT_PROFILE_DIR"):
+        return False
+    # update call 1 is the initial pre-rollout sync. Call 3 is therefore the
+    # update after rollout_id=1, i.e. the second training step.
+    target_call = int(os.getenv("VIME_UPDATE_WEIGHT_PROFILE_CALL", "3"))
+    return update_call == target_call
 
 
 class TrainProfiler:
@@ -69,7 +107,6 @@ def _create_torch_profiler(args, name):
         on_trace_ready=torch.profiler.tensorboard_trace_handler(
             args.tensorboard_dir,
             worker_name=f"{name}_rank_{torch.distributed.get_rank()}",
-            use_gzip=True,
         ),
         record_shapes=True,
         with_stack=True,

@@ -118,6 +118,14 @@ VLLM_ARGS=(
    --rollout-num-gpus-per-engine 4
    --vllm-gpu-memory-utilization "${VLLM_GPU_MEMORY_UTILIZATION}"
 )
+if [[ -n "${VIME_UPDATE_WEIGHT_PROFILE_DIR:-}" ]]; then
+   # Pass this through VIME's vLLM argument bridge explicitly: Ray runtime-env
+   # applies to the trainer, while rollout actors need the profiler config in
+   # their own launch command.
+   VLLM_ARGS+=(
+      --vllm-profiler-config "{\"profiler\":\"torch\",\"torch_profiler_dir\":\"${VIME_UPDATE_WEIGHT_PROFILE_DIR}/inference\",\"torch_profiler_with_stack\":true,\"torch_profiler_record_shapes\":true,\"ignore_frontend\":true}"
+   )
+fi
 
 UPDATE_WEIGHT_ARGS=(
    --update-weight-mode "${UPDATE_WEIGHT_MODE}"
@@ -150,7 +158,18 @@ ray start --head --port="${RAY_GCS_PORT}" --temp-dir="${RAY_TEMP_DIR}" \
 --node-ip-address 127.0.0.1 --disable-usage-stats \
 --dashboard-host=0.0.0.0 --dashboard-port="${RAY_DASHBOARD_PORT}"
 
-ray job submit --address="http://127.0.0.1:${RAY_DASHBOARD_PORT}" \
+RAY_JOB_ARGS=()
+if [[ -n "${VIME_UPDATE_WEIGHT_PROFILE_DIR:-}" ]]; then
+   PROFILE_RUNTIME_ENV=$(printf \
+      '{"env_vars":{"VIME_UPDATE_WEIGHT_PROFILE_DIR":"%s","VIME_UPDATE_WEIGHT_PROFILE_CALL":"%s","VLLM_VERSION":"%s","VLLM_RPC_TIMEOUT":"%s"}}' \
+      "${VIME_UPDATE_WEIGHT_PROFILE_DIR}" \
+      "${VIME_UPDATE_WEIGHT_PROFILE_CALL:-3}" \
+      "${VLLM_VERSION}" \
+      "${VLLM_RPC_TIMEOUT:-1800000}")
+   RAY_JOB_ARGS+=(--runtime-env-json "${PROFILE_RUNTIME_ENV}")
+fi
+
+ray job submit --address="http://127.0.0.1:${RAY_DASHBOARD_PORT}" "${RAY_JOB_ARGS[@]}" \
 -- python3 train.py \
 --actor-num-nodes 1 \
 --actor-num-gpus-per-node 4 \

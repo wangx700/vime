@@ -16,6 +16,7 @@ from ray.actor import ActorHandle
 from safetensors.torch import save_file
 
 from vime.utils.distributed_utils import get_gloo_group
+from vime.utils.profile_utils import should_profile_update_weight
 
 from .hf_weight_iterator_base import HfWeightIteratorBase
 
@@ -45,6 +46,7 @@ class UpdateWeightFromDisk:
         self.args = args
         self.weights_getter = weights_getter
         self.weight_version = 0
+        self._update_weight_call = 0
         self.update_weight_metrics: dict[str, float] = {}
         self.rollout_engines: list[ActorHandle] = []
         self._iterator = HfWeightIteratorBase.create(
@@ -78,6 +80,7 @@ class UpdateWeightFromDisk:
 
     @torch.no_grad()
     def update_weights(self) -> None:
+        self._update_weight_call += 1
         self.weight_version += 1
         version_dir = Path(self.args.update_weight_disk_dir) / f"weight_v{self.weight_version:06d}"
         started = time.perf_counter()
@@ -97,25 +100,34 @@ class UpdateWeightFromDisk:
         dist.barrier(group=get_gloo_group())
 
         if dist.get_rank() == 0:
+            profile_inference = should_profile_update_weight(self._update_weight_call)
+            inference_profile_started = False
+            if profile_inference:
+                ray.get([engine.start_profile.remote() for engine in self.rollout_engines])
+                inference_profile_started = True
             reload_started = time.perf_counter()
-            ray.get([engine.pause_generation.remote() for engine in self.rollout_engines])
-            paused = time.perf_counter()
             try:
-                ray.get([engine.flush_cache.remote() for engine in self.rollout_engines])
-                flushed = time.perf_counter()
-                ray.get(
-                    [
-                        engine.update_weights_from_disk.remote(
-                            model_path=str(version_dir),
-                            weight_version=str(self.weight_version),
-                        )
-                        for engine in self.rollout_engines
-                    ]
-                )
-                reloaded = time.perf_counter()
+                ray.get([engine.pause_generation.remote() for engine in self.rollout_engines])
+                paused = time.perf_counter()
+                try:
+                    ray.get([engine.flush_cache.remote() for engine in self.rollout_engines])
+                    flushed = time.perf_counter()
+                    ray.get(
+                        [
+                            engine.update_weights_from_disk.remote(
+                                model_path=str(version_dir),
+                                weight_version=str(self.weight_version),
+                            )
+                            for engine in self.rollout_engines
+                        ]
+                    )
+                    reloaded = time.perf_counter()
+                finally:
+                    ray.get([engine.continue_generation.remote() for engine in self.rollout_engines])
+                resumed = time.perf_counter()
             finally:
-                ray.get([engine.continue_generation.remote() for engine in self.rollout_engines])
-            resumed = time.perf_counter()
+                if inference_profile_started:
+                    ray.get([engine.stop_profile.remote() for engine in self.rollout_engines])
             self.update_weight_metrics.update(
                 {
                     "perf/update_weights_full_disk_write_time": write_finished - write_started,
