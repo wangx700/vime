@@ -15,7 +15,8 @@ pkill -9 redis
 set -ex
 
 export PYTHONUNBUFFERED=1
-export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
+export VLLM_VERSION="${VLLM_VERSION:-0.26.0}"
+export ASCEND_RT_VISIBLE_DEVICES="${ASCEND_RT_VISIBLE_DEVICES:?Set ASCEND_RT_VISIBLE_DEVICES explicitly}"
 export RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES=1
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export HCCL_HOST_SOCKET_PORT_RANGE=60000-60050
@@ -36,6 +37,8 @@ source "${SCRIPT_DIR}/models/qwen3-4B.sh"
 DATA_ROOT="${DATA_ROOT:-/root}"
 MODEL_PATH="${MODEL_PATH:-/home/vllm/weights/Qwen3-4B}"
 PROMPT_DATA_PATH="${PROMPT_DATA_PATH:-/home/vllm/c00944022/datasets/dapo-math-17k/dapo-math-17k.jsonl}"
+UPDATE_WEIGHT_MODE="${UPDATE_WEIGHT_MODE:-delta}"
+UPDATE_WEIGHT_TRANSPORT="${UPDATE_WEIGHT_TRANSPORT:-disk}"
 UPDATE_WEIGHT_DISK_DIR="${UPDATE_WEIGHT_DISK_DIR:-/home/vllm/c00944022/0623/vime-delta-weights}"
 UPDATE_WEIGHT_LOCAL_CHECKPOINT_DIR="${UPDATE_WEIGHT_LOCAL_CHECKPOINT_DIR:-/tmp/vime-rollout-checkpoint}"
 UPDATE_WEIGHT_MODE="${UPDATE_WEIGHT_MODE:-delta}"
@@ -120,9 +123,13 @@ UPDATE_WEIGHT_ARGS=(
    --update-weight-mode "${UPDATE_WEIGHT_MODE}"
    --update-weight-transport "${UPDATE_WEIGHT_TRANSPORT}"
 )
-if [[ "${UPDATE_WEIGHT_MODE}" == "delta" ]]; then
+if [[ "${UPDATE_WEIGHT_TRANSPORT}" == "disk" ]]; then
    UPDATE_WEIGHT_ARGS+=(
       --update-weight-disk-dir "${UPDATE_WEIGHT_DISK_DIR}"
+   )
+fi
+if [[ "${UPDATE_WEIGHT_MODE}" == "delta" ]]; then
+   UPDATE_WEIGHT_ARGS+=(
       --update-weight-local-checkpoint-dir "${UPDATE_WEIGHT_LOCAL_CHECKPOINT_DIR}"
       --update-weight-delta-encoding xor
       --update-weight-delta-checksum xxh3-128
