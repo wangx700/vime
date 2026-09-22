@@ -132,12 +132,13 @@ def get_vime_extra_args_provider(add_custom_arguments=None):
             # Delta weight sync.
             parser.add_argument(
                 "--update-weight-mode",
-                choices=["full", "delta"],
+                choices=["full", "delta", "sparse"],
                 default="full",
                 help=(
                     "Weight sync strategy. 'full' (default) broadcasts every parameter "
                     "every sync. 'delta' diffs each sync against a pinned-CPU snapshot of the "
-                    "previous one and ships only the changed bytes (disk transport only)."
+                    "previous one and ships only the changed bytes (disk transport only). "
+                    "'sparse' sends changed tensor elements through HCCL (NPU only)."
                 ),
             )
             parser.add_argument(
@@ -149,6 +150,23 @@ def get_vime_extra_args_provider(add_custom_arguments=None):
                     "'disk' writes a complete HF checkpoint under --update-weight-disk-dir "
                     "before engines reload it. Delta mode is 'disk' only: each host applies the "
                     "published deltas into its local checkpoint and reloads via update_weights_from_disk."
+                ),
+            )
+            try:
+                from vime.platforms import current_platform
+
+                default_megatron_to_hf_mode = current_platform().checkpoint.default_megatron_to_hf_mode
+            except Exception:  # noqa: BLE001 - argument help must remain available without accelerator dependencies
+                default_megatron_to_hf_mode = "raw"
+
+            parser.add_argument(
+                "--megatron-to-hf-mode",
+                choices=["raw", "bridge"],
+                default=default_megatron_to_hf_mode,
+                help=(
+                    "Method used to map Megatron parameters to Hugging Face parameter names. "
+                    "Sparse HCCL weight transfer requires 'bridge' so sparse indices address "
+                    "the same flattened tensors on the trainer and rollout workers."
                 ),
             )
             parser.add_argument(
@@ -2217,3 +2235,10 @@ def vime_validate_args(args):
                 "--update-weight-mode=delta requires --update-weight-local-checkpoint-dir "
                 "(a rollout-host-local NVMe directory)."
             )
+    elif args.update_weight_mode == "sparse":
+        if args.update_weight_transport != "nccl":
+            raise ValueError("--update-weight-mode=sparse requires --update-weight-transport=nccl.")
+        if args.colocate:
+            raise ValueError("--update-weight-mode=sparse is supported only for non-colocated rollout.")
+        if args.megatron_to_hf_mode != "bridge":
+            raise ValueError("--update-weight-mode=sparse requires --megatron-to-hf-mode=bridge.")

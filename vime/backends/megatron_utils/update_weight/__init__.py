@@ -19,7 +19,13 @@ def create_weight_updater(
     update_weight_mode = args.update_weight_mode
     update_weight_transport = args.update_weight_transport
 
-    if update_weight_mode == "delta":
+    if update_weight_mode == "sparse":
+        assert not args.colocate, "--update-weight-mode=sparse is not supported with --colocate"
+        assert update_weight_transport == "nccl", "--update-weight-mode=sparse requires --update-weight-transport=nccl"
+        from .update_weight_from_sparse_distributed import UpdateWeightFromSparseDistributed
+
+        update_weight_cls = UpdateWeightFromSparseDistributed
+    elif update_weight_mode == "delta":
         # Delta sync is disk-transport only: each engine's /pull_weights applies the published
         # deltas into a host-local checkpoint on every host it spans, and the engines reload
         # via vanilla update_weights_from_disk.

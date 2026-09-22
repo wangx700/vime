@@ -258,6 +258,7 @@ def make_vime_validate_args(**overrides):
         update_weight_disk_dir=None,
         update_weight_local_checkpoint_dir=None,
         update_weight_mode="full",
+        megatron_to_hf_mode="raw",
         rollout_temperature=1.0,
     )
     values.update(overrides)
@@ -414,6 +415,44 @@ def test_update_weight_delta_requires_local_checkpoint_dir(monkeypatch):
     )
 
     with pytest.raises(ValueError, match="requires --update-weight-local-checkpoint-dir"):
+        module.vime_validate_args(args)
+
+
+@pytest.mark.unit
+def test_update_weight_sparse_nccl_bridge_is_valid(monkeypatch):
+    module = load_vime_arguments_module(monkeypatch)
+    args = make_vime_validate_args(
+        update_weight_mode="sparse",
+        update_weight_transport="nccl",
+        megatron_to_hf_mode="bridge",
+    )
+
+    module.vime_validate_args(args)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        (
+            {"update_weight_transport": "disk", "update_weight_disk_dir": "/shared/sparse"},
+            "requires --update-weight-transport=nccl",
+        ),
+        ({"colocate": True}, "supported only for non-colocated rollout"),
+        ({"megatron_to_hf_mode": "raw"}, "requires --megatron-to-hf-mode=bridge"),
+    ],
+)
+def test_update_weight_sparse_rejects_incompatible_configuration(monkeypatch, overrides, message):
+    module = load_vime_arguments_module(monkeypatch)
+    sparse_config = {
+        "update_weight_mode": "sparse",
+        "update_weight_transport": "nccl",
+        "megatron_to_hf_mode": "bridge",
+        **overrides,
+    }
+    args = make_vime_validate_args(**sparse_config)
+
+    with pytest.raises(ValueError, match=message):
         module.vime_validate_args(args)
 
 

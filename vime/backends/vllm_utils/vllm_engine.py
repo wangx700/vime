@@ -99,7 +99,10 @@ def _run_vllm_server(kwargs: dict, env: dict) -> None:
     os.environ.update(env)
 
     from vllm.entrypoints.cli.serve import ServeSubcommand
-    from vllm.entrypoints.launchers.cli_args import make_arg_parser, validate_parsed_serve_args
+    try:
+        from vllm.entrypoints.launchers.cli_args import make_arg_parser, validate_parsed_serve_args
+    except ModuleNotFoundError:
+        from vllm.entrypoints.openai.cli_args import make_arg_parser, validate_parsed_serve_args
     from vllm.utils.argparse_utils import FlexibleArgumentParser
 
     ns = argparse.Namespace(**kwargs)
@@ -328,6 +331,8 @@ class VLLMEngine(RayActor):
         if self.node_rank != 0:
             return
         response = requests.get(f"http://{self.server_host}:{self.server_port}/weight_info")
+        if response.status_code == 404:
+            return self._weight_version
         try:
             response.raise_for_status()
         except requests.exceptions.HTTPError as error:
@@ -339,7 +344,12 @@ class VLLMEngine(RayActor):
 
     def set_weight_version(self, new_version: str):
         version = str(new_version)
-        result = self._make_request("update_weight_version", {"new_version": version})
+        try:
+            result = self._make_request("update_weight_version", {"new_version": version})
+        except requests.exceptions.HTTPError as error:
+            if error.response is None or error.response.status_code != 404:
+                raise
+            result = {"ok": True, "supported": False}
         self._weight_version = version
         return result
 
@@ -460,6 +470,33 @@ class VLLMEngine(RayActor):
         }
         result = self._make_request("update_weights", {"update_info": update_info})
         del weight_version
+        return result
+
+    def update_sparse_weights_from_distributed(
+        self,
+        names,
+        dtypes,
+        shapes,
+        num_updates_list,
+        group_name,
+        rank_num_updates_lists=None,
+        flush_cache=False,
+        weight_version: str | None = None,
+    ):
+        del group_name
+        if flush_cache:
+            self.flush_cache()
+        update_info = {
+            "names": list(names),
+            "dtype_names": [str(dtype).replace("torch.", "") for dtype in dtypes],
+            "shapes": [list(shape) for shape in shapes],
+            "num_updates_list": list(num_updates_list),
+        }
+        if rank_num_updates_lists is not None:
+            update_info["rank_num_updates_lists"] = [list(counts) for counts in rank_num_updates_lists]
+        result = self._make_request("update_weights", {"update_info": update_info})
+        if weight_version is not None:
+            self._weight_version = str(weight_version)
         return result
 
     def pause_generation(self):
@@ -692,7 +729,9 @@ def _compute_server_args(
     ):
         kwargs["max_model_len"] = args.rollout_max_context_len
 
-    if args.colocate:
+    if getattr(args, "update_weight_mode", "full") == "sparse":
+        kwargs["weight_transfer_config"] = {"backend": "sparse_hccl"}
+    elif args.colocate:
         kwargs["weight_transfer_config"] = {"backend": "ipc"}
     else:
         kwargs["weight_transfer_config"] = {"backend": "nccl"}
@@ -756,7 +795,10 @@ def _compute_server_args(
 def _vllm_server_field_names() -> frozenset[str]:
     """Return the vLLM fields accepted by CLI generation and config overrides."""
     from vllm.engine.arg_utils import AsyncEngineArgs
-    from vllm.entrypoints.launchers.cli_args import FrontendArgs
+    try:
+        from vllm.entrypoints.launchers.cli_args import FrontendArgs
+    except ModuleNotFoundError:
+        from vllm.entrypoints.openai.cli_args import FrontendArgs
 
     return frozenset(f.name for f in (*dataclasses.fields(AsyncEngineArgs), *dataclasses.fields(FrontendArgs)))
 
