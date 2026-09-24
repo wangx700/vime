@@ -24,6 +24,14 @@ class _FakeUpdater:
     ("mode", "transport", "colocate", "module_name", "class_name"),
     [
         pytest.param("delta", "disk", False, "update_weight_from_disk_delta", "UpdateWeightFromDiskDelta", id="delta"),
+        pytest.param(
+            "delta",
+            "sparse_hccl",
+            False,
+            "update_weight_from_sparse_hccl",
+            "UpdateWeightFromSparseHCCL",
+            id="sparse-hccl-delta",
+        ),
         pytest.param("full", "disk", False, "update_weight_from_disk", "UpdateWeightFromDisk", id="disk"),
         pytest.param("full", "nccl", True, "update_weight_from_tensor", "UpdateWeightFromTensor", id="colocated"),
         pytest.param(

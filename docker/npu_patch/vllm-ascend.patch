@@ -1,11 +1,375 @@
+diff --git a/tests/e2e/pull_request/two_card/test_hccl_weight_transfer.py b/tests/e2e/pull_request/two_card/test_hccl_weight_transfer.py
+index 9b999a61b..635e1ea7f 100644
+--- a/tests/e2e/pull_request/two_card/test_hccl_weight_transfer.py
++++ b/tests/e2e/pull_request/two_card/test_hccl_weight_transfer.py
+@@ -28,8 +28,9 @@ from the architecture config with random weights (only the tiny config/tokenizer
+ are needed, which the server already fetches). The parameter names/shapes/dtypes
+ match the real checkpoint, so the broadcast pipeline is fully exercised; we just
+ don't assert "coherent text" since the broadcast weights are random. Set
+-``WEIGHT_TRANSFER_TEST_MODEL=/path/to/checkpoint`` to instead broadcast real
+-weights from a local checkpoint.
++``VLLM_HCCL_TEST_MODEL=/path/to/checkpoint`` to use an already-provisioned
++model for both endpoints, or ``WEIGHT_TRANSFER_TEST_MODEL=/path/to/checkpoint``
++to instead broadcast real weights from a local checkpoint.
+ 
+ Topology (requires 2 NPUs):
+ - NPU 0: vLLM inference worker (rank 1 in the HCCL group)
+@@ -44,6 +45,7 @@ Run with::
+ 
+ import os
+ import threading
++import time
+ 
+ import pytest
+ import requests
+@@ -54,11 +56,16 @@ from vllm.utils.network_utils import get_ip, get_open_port
+ 
+ from tests.e2e.conftest import RemoteOpenAIServer
+ 
+-MODEL_NAME = "Qwen/Qwen3-0.6B"
++# Keep the upstream-sized default, while allowing offline CI to select an
++# already-provisioned checkpoint for both the vLLM server and trainer config.
++MODEL_NAME = os.environ.get("VLLM_HCCL_TEST_MODEL", "Qwen/Qwen3-0.6B")
+ 
+ # Device 0 hosts the inference worker, device 1 hosts the trainer.
+-INFERENCE_WORLD_SIZE = 1
++INFERENCE_WORLD_SIZE = int(os.getenv("VLLM_HCCL_TEST_TP", "1"))
+ TRAINER_DEVICE_INDEX = INFERENCE_WORLD_SIZE
++UPDATE_ROUNDS = int(os.getenv("VLLM_HCCL_TEST_ROUNDS", "1"))
++MUTATE_WEIGHTS = os.getenv("VLLM_HCCL_TEST_MUTATE_WEIGHTS", "0") == "1"
++WEIGHT_DELTA = float(os.getenv("VLLM_HCCL_TEST_WEIGHT_DELTA", "0.0001"))
+ 
+ PROMPTS = [
+     "Hello, my name is",
+@@ -167,9 +174,17 @@ def _collect_weight_metadata(train_model):
+     return names, dtype_names, shapes, packed_buffer_size_bytes
+ 
+ 
++def _advance_full_model_weights(model: torch.nn.Module) -> None:
++    """Make every full-update payload distinct for a multi-round benchmark."""
++    with torch.no_grad():
++        for parameter in model.parameters():
++            parameter.add_(WEIGHT_DELTA)
++    torch.npu.synchronize()
++
++
+ @pytest.mark.skipif(
+-    torch.npu.device_count() < 2,
+-    reason="HCCL weight transfer e2e test requires at least 2 NPUs.",
++    torch.npu.device_count() < INFERENCE_WORLD_SIZE + 1,
++    reason="HCCL E2E requires one trainer NPU plus the rollout TP NPUs.",
+ )
+ def test_hccl_weight_transfer_updates_server_weights():
+     port = get_open_port()
+@@ -196,7 +211,9 @@ def test_hccl_weight_transfer_updates_server_weights():
+     # Pin the server to NPU 0 so the trainer can own NPU 1 exclusively.
+     env_dict = {
+         "VLLM_SERVER_DEV_MODE": "1",
+-        "ASCEND_RT_VISIBLE_DEVICES": "0",
++        "ASCEND_RT_VISIBLE_DEVICES": ",".join(
++            str(index) for index in range(INFERENCE_WORLD_SIZE)
++        ),
+     }
+ 
+     _log(f"starting server on port {port} (device 0, dummy weights) ...")
+@@ -262,11 +279,6 @@ def test_hccl_weight_transfer_updates_server_weights():
+         init_thread.raise_if_failed()
+         _log("HCCL process group established")
+ 
+-        # 4) Pause generation and start the weight update lifecycle.
+-        _post(server, "pause")
+-        _post(server, "start_weight_update")
+-        _log("paused; weight update lifecycle started")
+-
+         names, dtype_names, shapes, packed_buffer_size_bytes = _collect_weight_metadata(train_model)
+         update_info = dict(
+             names=names,
+@@ -275,34 +287,51 @@ def test_hccl_weight_transfer_updates_server_weights():
+             packed=True,
+             packed_buffer_size_bytes=packed_buffer_size_bytes,
+         )
+-        # update_weights blocks on the server while it waits for HCCL broadcasts,
+-        # so run it in a thread while the trainer produces the data.
+-        _log(f"broadcasting {len(names)} tensors via HCCL (packed) ...")
+-        update_thread = _BackgroundPost(
+-            server,
+-            "update_weights",
+-            json={"update_info": update_info},
+-            timeout=UPDATE_TIMEOUT,
+-        )
+-        update_thread.start()
+-
+         trainer_args = HCCLTrainerSendWeightsArgs(
+             group=model_update_group,
+             packed=True,
+             packed_buffer_size_bytes=packed_buffer_size_bytes,
+         )
+-        HCCLWeightTransferEngine.trainer_send_weights(
+-            iterator=train_model.named_parameters(),
+-            trainer_args=trainer_args,
+-        )
+-        _log("trainer finished sending weights, waiting for server update RPC ...")
+-        update_thread.join()
+-        update_thread.raise_if_failed()
+-        _log("weight broadcast complete")
+-
+-        # 5) Finalize the lifecycle and resume generation.
+-        _post(server, "finish_weight_update")
+-        _post(server, "resume")
++        for round_index in range(1, UPDATE_ROUNDS + 1):
++            if MUTATE_WEIGHTS:
++                _advance_full_model_weights(train_model)
++            round_started = time.perf_counter()
++            _post(server, "pause")
++            _post(server, "start_weight_update")
++            _log("paused; weight update lifecycle started")
++            # update_weights blocks on the server while it waits for HCCL
++            # broadcasts, so run it while the trainer produces the data.
++            _log(f"broadcasting {len(names)} tensors via HCCL (packed) ...")
++            update_thread = _BackgroundPost(
++                server,
++                "update_weights",
++                json={"update_info": update_info},
++                timeout=UPDATE_TIMEOUT,
++            )
++            update_thread.start()
++            send_started = time.perf_counter()
++            HCCLWeightTransferEngine.trainer_send_weights(
++                iterator=train_model.named_parameters(),
++                trainer_args=trainer_args,
++            )
++            torch.npu.synchronize()
++            send_seconds = time.perf_counter() - send_started
++            _log("trainer finished sending weights, waiting for server update RPC ...")
++            update_thread.join()
++            update_thread.raise_if_failed()
++            update_seconds = time.perf_counter() - send_started
++            _log("weight broadcast complete")
++            # Finalize one update before starting the next round.
++            _post(server, "finish_weight_update")
++            _post(server, "resume")
++            _log(
++                "BENCH backend=hccl "
++                f"tp={INFERENCE_WORLD_SIZE} round={round_index} "
++                f"payload_revision={round_index if MUTATE_WEIGHTS else 0} "
++                f"trainer_send_s={send_seconds:.6f} "
++                f"server_update_s={update_seconds:.6f} "
++                f"lifecycle_s={time.perf_counter() - round_started:.6f}"
++            )
+ 
+         # 6) Generation after the broadcast weights are loaded.
+         outputs_after = _generate(client, MODEL_NAME, PROMPTS)
+diff --git a/tests/ut/ops/test_routed_experts.py b/tests/ut/ops/test_routed_experts.py
+index 9591da90b..4616572bf 100644
+--- a/tests/ut/ops/test_routed_experts.py
++++ b/tests/ut/ops/test_routed_experts.py
+@@ -18,6 +18,52 @@ def _routed_experts(weight_views):
+     return routed_experts
+ 
+ 
++def _tp4_routed_experts():
++    routed_experts = AscendRoutedExperts.__new__(AscendRoutedExperts)
++    routed_experts.moe_config = SimpleNamespace(
++        moe_parallel_config=SimpleNamespace(tp_size=4)
++    )
++    return routed_experts
++
++
++def test_checkpoint_loader_view_restores_postprocessed_w13_layout():
++    runtime = torch.empty(2048, 384)
++    checkpoint = torch.empty(768, 2048)
++
++    view, shard_dim = _tp4_routed_experts()._checkpoint_loader_view(
++        runtime, checkpoint, "w1", 1
++    )
++
++    assert view.shape == (384, 2048)
++    assert shard_dim == 0
++    assert view.untyped_storage().data_ptr() == runtime.untyped_storage().data_ptr()
++
++
++def test_checkpoint_loader_view_restores_postprocessed_w2_layout():
++    runtime = torch.empty(192, 2048)
++    checkpoint = torch.empty(2048, 768)
++
++    view, shard_dim = _tp4_routed_experts()._checkpoint_loader_view(
++        runtime, checkpoint, "w2", 0
++    )
++
++    assert view.shape == (2048, 192)
++    assert shard_dim == 1
++    assert view.untyped_storage().data_ptr() == runtime.untyped_storage().data_ptr()
++
++
++def test_checkpoint_loader_view_leaves_checkpoint_layout_unchanged():
++    checkpoint_layout = torch.empty(384, 2048)
++    checkpoint = torch.empty(768, 2048)
++
++    view, shard_dim = _tp4_routed_experts()._checkpoint_loader_view(
++        checkpoint_layout, checkpoint, "w1", 0
++    )
++
++    assert view is checkpoint_layout
++    assert shard_dim == 0
++
++
+ def test_get_expert_weights_flattens_layout_aware_views():
+     weights = [torch.randn(2, 3, 4), torch.randn(2, 5)]
+ 
+diff --git a/vllm_ascend/distributed/device_communicators/pyhccl.py b/vllm_ascend/distributed/device_communicators/pyhccl.py
+index 44d1b12fc..bfc75b379 100644
+--- a/vllm_ascend/distributed/device_communicators/pyhccl.py
++++ b/vllm_ascend/distributed/device_communicators/pyhccl.py
+@@ -169,3 +169,39 @@ class PyHcclCommunicator:
+             self.comm,
+             aclrtStream_t(stream.npu_stream),
+         )
++
++    def send(self, tensor: torch.Tensor, dst: int, stream=None) -> None:
++        """Send one contiguous tensor to a communicator rank."""
++        if self.disabled:
++            return
++        assert tensor.device == self.device
++        if not tensor.is_contiguous():
++            raise ValueError("PyHCCL send requires a contiguous tensor")
++        if stream is None:
++            stream = current_stream()
++        self.hccl.hcclSend(
++            buffer_type(tensor.data_ptr()),
++            tensor.numel(),
++            hcclDataTypeEnum.from_torch(tensor.dtype),
++            dst,
++            self.comm,
++            aclrtStream_t(stream.npu_stream),
++        )
++
++    def recv(self, tensor: torch.Tensor, src: int, stream=None) -> None:
++        """Receive one contiguous tensor from a communicator rank."""
++        if self.disabled:
++            return
++        assert tensor.device == self.device
++        if not tensor.is_contiguous():
++            raise ValueError("PyHCCL recv requires a contiguous tensor")
++        if stream is None:
++            stream = current_stream()
++        self.hccl.hcclRecv(
++            buffer_type(tensor.data_ptr()),
++            tensor.numel(),
++            hcclDataTypeEnum.from_torch(tensor.dtype),
++            src,
++            self.comm,
++            aclrtStream_t(stream.npu_stream),
++        )
+diff --git a/vllm_ascend/distributed/device_communicators/pyhccl_wrapper.py b/vllm_ascend/distributed/device_communicators/pyhccl_wrapper.py
+index a09ce3998..29c43865e 100644
+--- a/vllm_ascend/distributed/device_communicators/pyhccl_wrapper.py
++++ b/vllm_ascend/distributed/device_communicators/pyhccl_wrapper.py
+@@ -162,6 +162,36 @@ class HCCLLibrary:
+                 aclrtStream_t,
+             ],
+         ),
++        # HcclResult HcclSend(
++        #   void *sendBuf, uint64_t count, HcclDataType dataType,
++        #   uint32_t destRank, HcclComm comm, aclrtStream stream);
++        Function(
++            "HcclSend",
++            hcclResult_t,
++            [
++                buffer_type,
++                ctypes.c_size_t,
++                hcclDataType_t,
++                ctypes.c_int,
++                hcclComm_t,
++                aclrtStream_t,
++            ],
++        ),
++        # HcclResult HcclRecv(
++        #   void *recvBuf, uint64_t count, HcclDataType dataType,
++        #   uint32_t srcRank, HcclComm comm, aclrtStream stream);
++        Function(
++            "HcclRecv",
++            hcclResult_t,
++            [
++                buffer_type,
++                ctypes.c_size_t,
++                hcclDataType_t,
++                ctypes.c_int,
++                hcclComm_t,
++                aclrtStream_t,
++            ],
++        ),
+         # HcclResult HcclCommDestroy(HcclComm comm);
+         Function("HcclCommDestroy", hcclResult_t, [hcclComm_t]),
+     ]
+@@ -200,7 +230,13 @@ class HCCLLibrary:
+         if so_file not in HCCLLibrary.path_to_dict_mapping:
+             _funcs: dict[str, Any] = {}
+             for func in HCCLLibrary.exported_functions:
+-                f = getattr(self.lib, func.name)
++                f = getattr(self.lib, func.name, None)
++                if f is None and func.name in {"HcclSend", "HcclRecv"}:
++                    continue
++                if f is None:
++                    raise AttributeError(
++                        f"HCCL library does not export {func.name}"
++                    )
+                 f.restype = func.restype
+                 f.argtypes = func.argtypes
+                 _funcs[func.name] = f
+@@ -249,6 +285,40 @@ class HCCLLibrary:
+     ) -> None:
+         self.HCCL_CHECK(self._funcs["HcclBroadcast"](buf, count, datatype, root, comm, stream))
+ 
++    def hcclSend(
++        self,
++        buf: buffer_type,
++        count: int,
++        datatype: int,
++        dest_rank: int,
++        comm: hcclComm_t,
++        stream: aclrtStream_t,
++    ) -> None:
++        if "HcclSend" not in self._funcs:
++            raise NotImplementedError("The installed HCCL does not support P2P send")
++        self.HCCL_CHECK(
++            self._funcs["HcclSend"](
++                buf, count, datatype, dest_rank, comm, stream
++            )
++        )
++
++    def hcclRecv(
++        self,
++        buf: buffer_type,
++        count: int,
++        datatype: int,
++        src_rank: int,
++        comm: hcclComm_t,
++        stream: aclrtStream_t,
++    ) -> None:
++        if "HcclRecv" not in self._funcs:
++            raise NotImplementedError("The installed HCCL does not support P2P recv")
++        self.HCCL_CHECK(
++            self._funcs["HcclRecv"](
++                buf, count, datatype, src_rank, comm, stream
++            )
++        )
++
+     def hcclCommDestroy(self, comm: hcclComm_t) -> None:
+         self.HCCL_CHECK(self._funcs["HcclCommDestroy"](comm))
+ 
 diff --git a/vllm_ascend/distributed/weight_transfer/__init__.py b/vllm_ascend/distributed/weight_transfer/__init__.py
-index d6434f05f..fd7223836 100644
+index d6434f05f..e438d8b6b 100644
 --- a/vllm_ascend/distributed/weight_transfer/__init__.py
 +++ b/vllm_ascend/distributed/weight_transfer/__init__.py
-@@ -33,6 +33,11 @@ def register_engine():
+@@ -33,6 +33,16 @@ def register_engine():
          "vllm_ascend.distributed.weight_transfer.npu_ipc_engine",
          "NPUIPCWeightTransferEngine",
      )
++    WeightTransferEngineFactory.register_engine(
++        "sparse_hccl",
++        "vllm_ascend.distributed.weight_transfer.sparse_hccl_engine",
++        "SparseHCCLWeightTransferEngine",
++    )
 +    WeightTransferTrainerFactory.register_engine(
 +        "hccl",
 +        "vllm_ascend.distributed.weight_transfer.hccl_engine",
@@ -15,7 +379,7 @@ index d6434f05f..fd7223836 100644
          "npu_ipc",
          "vllm_ascend.distributed.weight_transfer.npu_ipc_engine",
 diff --git a/vllm_ascend/distributed/weight_transfer/hccl_engine.py b/vllm_ascend/distributed/weight_transfer/hccl_engine.py
-index 023ffd1ae..7b184e279 100644
+index 023ffd1ae..7be6edbc2 100644
 --- a/vllm_ascend/distributed/weight_transfer/hccl_engine.py
 +++ b/vllm_ascend/distributed/weight_transfer/hccl_engine.py
 @@ -3,8 +3,9 @@
@@ -291,6 +655,95 @@ index a35d9af8d..d55c988c3 100644
          yield {
              "names": names,
              "shapes": shapes,
+diff --git a/vllm_ascend/ops/fused_moe/routed_experts.py b/vllm_ascend/ops/fused_moe/routed_experts.py
+index c328def60..cd54e258c 100644
+--- a/vllm_ascend/ops/fused_moe/routed_experts.py
++++ b/vllm_ascend/ops/fused_moe/routed_experts.py
+@@ -332,6 +332,84 @@ class AscendRoutedExperts(RoutedExperts):  # type: ignore[no-redef]
+ 
+     moe_counter = -1
+ 
++    def _checkpoint_loader_view(
++        self,
++        expert_data: torch.Tensor,
++        loaded_weight: torch.Tensor,
++        shard_id: str,
++        shard_dim: int,
++    ) -> tuple[torch.Tensor, int]:
++        """Expose postprocessed Ascend MoE weights in checkpoint layout.
++
++        ``AscendUnquantizedFusedMoEMethod.process_weights_after_loading``
++        transposes the last two dimensions of w13/w2 for execution.  Online
++        updates still enter the upstream checkpoint loader, whose shard
++        metadata describes the pre-transpose layout.  Return a view of the
++        same storage in that layout so the normal TP-aware loader can be
++        reused without copying the full expert tensor.
++        """
++        if expert_data.ndim != 2 or loaded_weight.ndim != 2:
++            return expert_data, shard_dim
++
++        tp_size = self.moe_config.moe_parallel_config.tp_size
++        if shard_id in ("w1", "w3"):
++            is_transposed = (
++                expert_data.shape[0] == loaded_weight.shape[1]
++                and expert_data.shape[1] * tp_size
++                == 2 * loaded_weight.shape[0]
++            )
++            if is_transposed:
++                return expert_data.transpose(0, 1), 0
++        elif shard_id == "w2":
++            is_transposed = (
++                expert_data.shape[1] == loaded_weight.shape[0]
++                and expert_data.shape[0] * tp_size
++                == loaded_weight.shape[1]
++            )
++            if is_transposed:
++                return expert_data.transpose(0, 1), 1
++        return expert_data, shard_dim
++
++    def _load_w13(
++        self,
++        expert_data: torch.Tensor,
++        shard_dim: int,
++        shard_id: str,
++        loaded_weight: torch.Tensor,
++        tp_rank: int,
++        load_full: bool = False,
++    ):
++        expert_data, shard_dim = self._checkpoint_loader_view(
++            expert_data, loaded_weight, shard_id, shard_dim
++        )
++        return super()._load_w13(
++            expert_data=expert_data,
++            shard_dim=shard_dim,
++            shard_id=shard_id,
++            loaded_weight=loaded_weight,
++            tp_rank=tp_rank,
++            load_full=load_full,
++        )
++
++    def _load_w2(
++        self,
++        expert_data: torch.Tensor,
++        shard_dim: int,
++        loaded_weight: torch.Tensor,
++        tp_rank: int,
++        load_full: bool = False,
++    ):
++        expert_data, shard_dim = self._checkpoint_loader_view(
++            expert_data, loaded_weight, "w2", shard_dim
++        )
++        return super()._load_w2(
++            expert_data=expert_data,
++            shard_dim=shard_dim,
++            loaded_weight=loaded_weight,
++            tp_rank=tp_rank,
++            load_full=load_full,
++        )
++
+     def __init__(
+         self,
+         *args,
 diff --git a/vllm_ascend/worker/v2/model_runner.py b/vllm_ascend/worker/v2/model_runner.py
 index c388619f2..38a7d2fb7 100644
 --- a/vllm_ascend/worker/v2/model_runner.py
@@ -325,7 +778,7 @@ index 6d99ac76a..b7df4df22 100644
 --- a/vllm_ascend/worker/worker.py
 +++ b/vllm_ascend/worker/worker.py
 @@ -321,7 +321,48 @@ class NPUWorker(WorkerBase):
-
+ 
      def start_weight_update(self) -> None:
          """Begin a new weight update; prepares the model for layerwise reload."""
 +        with set_current_vllm_config(self.vllm_config):
@@ -370,13 +823,13 @@ index 6d99ac76a..b7df4df22 100644
 +            raise RuntimeError(
 +                f"{type(self.weight_transfer_engine).__name__} does not support draft model weight updates."
 +            )
-
+ 
          if self._weight_update_active:
              raise RuntimeError(
 @@ -330,11 +371,16 @@ class NPUWorker(WorkerBase):
-
+ 
          self._check_nz_disabled()
-
+ 
 -        assert self.weight_transfer_engine is not None
 -        self.weight_transfer_engine.start_weight_update()
 +        try:
@@ -387,7 +840,7 @@ index 6d99ac76a..b7df4df22 100644
 +            self.weight_transfer_engine.reset_weight_update_target()
 +            raise
          self._weight_update_active = True
-
+ 
 -    def update_weights(self, update_info: dict) -> None:
 +    def update_weights(self, update_info: dict | list[dict]) -> None:
          """Receive a chunk of weights from the trainer and load them in place."""
@@ -396,7 +849,7 @@ index 6d99ac76a..b7df4df22 100644
 @@ -343,11 +389,19 @@ class NPUWorker(WorkerBase):
          if not self._weight_update_active:
              raise RuntimeError("start_weight_update must be called before update_weights.")
-
+ 
 -        try:
 -            self.weight_transfer_engine.update_weights(update_info)
 -        except BaseException:
@@ -415,12 +868,12 @@ index 6d99ac76a..b7df4df22 100644
 +                self._weight_update_active = False
 +                self.weight_transfer_engine.reset_weight_update_target()
 +                raise
-
+ 
      def finish_weight_update(self) -> None:
          """Finish the current weight update; runs layerwise postprocessing."""
 @@ -357,8 +411,12 @@ class NPUWorker(WorkerBase):
              raise RuntimeError("start_weight_update must be called before finish_weight_update.")
-
+ 
          assert self.weight_transfer_engine is not None
 -        self.weight_transfer_engine.finish_weight_update()
 -        self._weight_update_active = False
@@ -430,7 +883,7 @@ index 6d99ac76a..b7df4df22 100644
 +            finally:
 +                self._weight_update_active = False
 +                self.weight_transfer_engine.reset_weight_update_target()
-
+ 
      def shutdown(self) -> None:
          if ensure_kv_transfer_shutdown is not None:
 @@ -448,7 +506,9 @@ class NPUWorker(WorkerBase):
@@ -446,7 +899,7 @@ index 6d99ac76a..b7df4df22 100644
                  f"Free memory on device "
 @@ -597,7 +657,9 @@ class NPUWorker(WorkerBase):
          self.non_torch_memory = profile_result.non_torch_increase
-
+ 
          free_gpu_memory = profile_result.after_profile.free_memory
 -        assert self.init_snapshot.free_memory > free_gpu_memory, (
 +        weight_transfer_config = self.vllm_config.weight_transfer_config
@@ -457,7 +910,7 @@ index 6d99ac76a..b7df4df22 100644
              f"current free memory {GiB(free_gpu_memory)} GiB. "
 @@ -1118,8 +1180,12 @@ class NPUWorker(WorkerBase):
              from contextlib import nullcontext
-
+ 
              context = nullcontext()  # type: ignore
 -        with context:
 -            self.model_runner.initialize_kv_cache(kv_cache_config)
@@ -467,6 +920,6 @@ index 6d99ac76a..b7df4df22 100644
 +        else:
 +            with context:
 +                self.model_runner.initialize_kv_cache(kv_cache_config)
-
+ 
          # MRV2's scheduler emits new_block_ids_to_zero whenever this flag is
          # set, so its worker-side consumer must use the same condition. Keep the
