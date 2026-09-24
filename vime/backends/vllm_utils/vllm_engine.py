@@ -74,7 +74,7 @@ def _build_subprocess_env(server_args_dict: dict[str, Any]) -> dict[str, str]:
         colocate=getattr(args, "colocate", False),
     )
     env.setdefault("VLLM_SERVER_DEV_MODE", "1")
-    env["VLLM_USE_V2_MODEL_RUNNER"] = "1"
+    env.setdefault("VLLM_USE_V2_MODEL_RUNNER", "1")
     if getattr(args, "vllm_enable_deterministic_inference", False):
         env["VLLM_BATCH_INVARIANT"] = "1"
     if getattr(args, "colocate", False):
@@ -694,6 +694,8 @@ def _compute_server_args(
 
     if args.colocate:
         kwargs["weight_transfer_config"] = {"backend": "ipc"}
+    elif args.update_weight_mode == "delta" and args.update_weight_transport == "sparse_hccl":
+        kwargs["weight_transfer_config"] = {"backend": "sparse_hccl"}
     else:
         kwargs["weight_transfer_config"] = {"backend": "nccl"}
     kwargs["weight_transfer_config"]["backend"] = current_platform().weight_transfer.backend(

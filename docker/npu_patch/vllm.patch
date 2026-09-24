@@ -156,3 +156,22 @@ index 1d30a0eaf6..37239f7f62 100644
 +        )
          inputs_embeds = self.enorm(inputs_embeds)
          previous_hidden_states = self.hnorm(previous_hidden_states)
+diff --git a/vllm/distributed/weight_transfer/clients.py b/vllm/distributed/weight_transfer/clients.py
+index 1bd2f9893..3eb970ec5 100644
+--- a/vllm/distributed/weight_transfer/clients.py
++++ b/vllm/distributed/weight_transfer/clients.py
+@@ -73,7 +73,13 @@ class HTTPVLLMWeightSyncClient:
+         response = requests.post(
+             f"{self.base_url}/{path}", json=json, timeout=self.timeout
+         )
+-        response.raise_for_status()
++        try:
++            response.raise_for_status()
++        except requests.HTTPError as error:
++            raise RuntimeError(
++                f"Weight-transfer request {path!r} failed with HTTP "
++                f"{response.status_code}: {response.text}"
++            ) from error
+ 
+     def init_weight_transfer_engine(self, init_info: dict[str, Any]) -> None:
+         self._post("init_weight_transfer_engine", {"init_info": init_info})
