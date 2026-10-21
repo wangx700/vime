@@ -7,8 +7,8 @@ every sync is the dominant cost.
 
 Two transports are available: `disk` for shared-storage and cross-cluster deployments, and
 `sparse_hccl` for online transfer between Ascend trainers and vLLM-Ascend rollout workers.
-Sparse HCCL sends complete int32 indices and values on the first sync, then only
-changed indices and values on later syncs through the same native protocol.
+Sparse HCCL bootstraps with complete values over dense HCCL, then sends only
+changed indices and values on later syncs using the same communication group.
 
 ## Configuration
 
@@ -66,11 +66,35 @@ Deltas are always zstd-compressed (level 1); profiling showed it dominates lz4 /
 
 ### Sparse HCCL
 
-1. The first sync streams the full Megatron-to-HF export as bounded index/value patches. Every checkpoint position is included. Each rank captures its local Megatron shard snapshot in host memory only after initialization completes. BF16 initialization uses six payload bytes per element, so its cost is reported separately from steady updates.
+1. For the first sync, the synchronization adapter reuses full mode's existing `HfWeightIteratorDirect`, the dense HCCL sender, and the public dense checkpoint loader. No index tensors or NaN staging are needed. All training ranks participate in export; only rank 0 sends. Bridge still provides the sparse export index. Neither exporter implementation changes, and this does not enable MoE direct writes. Each rank captures its local Megatron shard snapshot in host memory only after initialization completes.
+
 2. Later syncs bit-diff each current shard against its snapshot through an integer view, then advance the snapshot immediately.
 3. A NaN probe maps local changes to final HF names and global flat indices. PP non-owners, DP/CP replicas, and unchanged ranks retain zero-count lockstep directory rows.
 4. TP, EP/ETP, and PP/VPP ranks execute batched variable-length gathers over one common directory. The wire master constructs public `SparseWeightPatch` objects and sends bounded lists through `send_weight_chunk`.
 5. The receiver validates checkpoint patches and uses native weight loaders to update live weights in place. This protocol adds neither checksum metadata nor MoE direct writes. Independent correctness tests compare reconstructed/full exports and receiver parameter hashes against dense loading. A potentially partial update failure prevents updater reuse until recovery.
+
+Sparse transport uses the non-packed path. Every PP worker consumes all broadcasts before
+filtering its parameters. Both image dependency patches must be installed together.
+
+The patched Ascend test `tests/e2e/pull_request/eight_card/test_sparse_hccl_checkpoint.py`
+includes a `restore-normal` case. Run it with `pytest -s` and
+`-k 'restore-normal and tp2-pp2-ep2'` on five available NPUs. It keeps an
+independent normal checkpoint, subtracts random changes at random coordinates
+and shard boundaries to construct a perturbed base, and restores it through
+sparse HCCL. The sparse transfer must reproduce every worker's full parameter
+hashes and deterministic generated tokens. Patch values are replacement target
+values, not additive differences. This small synthetic Qwen3-MoE case checks
+protocol correctness, not pretrained-model accuracy or performance.
+
+For a separate attribution run, set `VLLM_WEIGHT_TRANSFER_PROFILE=1` in both trainer
+and rollout worker environments. `WEIGHT_TRANSFER_PROFILE` records cumulative
+seconds and call counts for each phase and rank. Profiling synchronizes the device;
+use a run with profiling disabled for throughput comparisons. Inclusive parent
+phases overlap their child phases and must not be summed together; compare ranks
+by their critical-path maximum, rather than summing worker times.
+`receiver_apply` waits for completed device work. Its per-tensor child phases
+ending in `_host_dispatch` measure host residence (including implicit waits)
+without adding device synchronization; they are not isolated kernel timings.
 
 ### Disk transport
 

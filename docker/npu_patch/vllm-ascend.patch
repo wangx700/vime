@@ -581,7 +581,7 @@ diff --git a/vllm_ascend/distributed/weight_transfer/sparse_hccl_engine.py b/vll
 new file mode 100644
 --- /dev/null
 +++ b/vllm_ascend/distributed/weight_transfer/sparse_hccl_engine.py
-@@ -0,0 +1,350 @@
+@@ -0,0 +1,410 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Sparse HCCL weight transfer engine.
@@ -591,10 +591,12 @@ new file mode 100644
 +packed parameters.
 +"""
 +
++import logging
 +from collections.abc import Iterable
 +from concurrent.futures import ThreadPoolExecutor
 +from contextlib import ExitStack
 +from dataclasses import asdict, dataclass
++from math import prod
 +from typing import TYPE_CHECKING, ClassVar
 +
 +import torch
@@ -610,6 +612,7 @@ new file mode 100644
 +    WeightSource,
 +    WeightTransferEngine,
 +)
++from vllm.distributed.weight_transfer.profiling import WeightTransferProfiler
 +from vllm.distributed.weight_transfer.sparse_nccl_engine import (
 +    SparseNCCLTrainerInitInfo,
 +    SparseNCCLTrainerWeightTransferEngine,
@@ -622,6 +625,7 @@ new file mode 100644
 +from vllm.model_executor.models.utils import is_pp_missing_parameter
 +
 +from vllm_ascend.distributed.weight_transfer.hccl_engine import (
++    HCCLTrainerSendWeightsArgs,
 +    HCCLWeightTransferEngine,
 +    HCCLWeightTransferInitInfo,
 +)
@@ -660,8 +664,8 @@ new file mode 100644
 +    """Trainer-side init info for the sparse HCCL weight transfer backend.
 +
 +    Same rendezvous shape as the dense HCCL backend (the sender opens its
-+    endpoint as HCCL rank 0), but with no packed wire params: sparse transfers
-+    are never packed. `backend` is the factory dispatch key."""
++    endpoint as HCCL rank 0), with no packed sparse transport.
++    `backend` is the factory dispatch key."""
 +
 +    backend: ClassVar[str] = "sparse_hccl"
 +
@@ -670,7 +674,12 @@ new file mode 100644
 +class SparseHCCLWeightTransferUpdateInfo(SparseNCCLWeightTransferUpdateInfo):
 +    """Update info for the sparse HCCL weight transfer backend."""
 +
++    dense: bool = False
++    """Transmit complete checkpoint values without indices for bootstrap."""
++
 +    def __post_init__(self) -> None:
++        if type(self.dense) is not bool:
++            raise ValueError("dense must be a boolean")
 +        num_params = len(self.names)
 +        if len(self.dtype_names) != num_params:
 +            raise ValueError(
@@ -702,6 +711,8 @@ new file mode 100644
 +                raise ValueError(f"Invalid checkpoint shape: {name}")
 +            if type(count) is not int:
 +                raise ValueError(f"Sparse update count must be an integer: {name}")
++            if self.dense and count != prod(shape):
++                raise ValueError(f"Dense update count must match checkpoint shape: {name}")
 +
 +
 +class SparseHCCLWeightTransferEngine(
@@ -771,34 +782,38 @@ new file mode 100644
 +        device = self.model_update_group.device
 +        with torch.npu.device(device):
 +            stream = torch.npu.current_stream(device=device)
-+            patches = []
-+            for name, dtype_name, shape, num_updates in zip(
-+                update_info.names,
-+                update_info.dtype_names,
-+                update_info.shapes,
-+                update_info.num_updates_list,
-+                strict=True,
-+            ):
-+                dtype = getattr(torch, dtype_name)
-+                indices = torch.empty(num_updates, dtype=torch.int32, device=device)
-+                values = torch.empty(num_updates, dtype=dtype, device=device)
-+                if num_updates:
++            profile = WeightTransferProfiler(device=device)
++            with profile.measure("receiver_receive"):
++                patches = self._receive_patches(update_info, stream)
++            # All ranks consume the complete wire payload before PP selection.
++            with profile.measure("receiver_pp_filter"):
++                patches = [patch for patch in patches if not is_pp_missing_parameter(patch.name, self.model)]
++            with profile.measure("receiver_apply"):
++                with checkpoint_loader_views(self.model):
++                    load_checkpoint_weight_patches(self.model, patches, phase_observer=profile.measure_host)
++            profile.log(
++                logging.getLogger(__name__),
++                role="receiver",
++                dense=update_info.dense,
++                device=str(device),
++                rank=self.parallel_config.rank,
++                dp_rank=self.parallel_config.data_parallel_index,
++            )
++
++    def _receive_patches(self, info, stream):
++        device = self.model_update_group.device
++        patches = []
++        for name, dtype_name, shape, count in zip(
++            info.names, info.dtype_names, info.shapes, info.num_updates_list, strict=True
++        ):
++            indices = None if info.dense else torch.empty(count, dtype=torch.int32, device=device)
++            values = torch.empty(count, dtype=getattr(torch, dtype_name), device=device)
++            if count:
++                if indices is not None:
 +                    self.model_update_group.broadcast(indices, src=0, stream=stream)
-+                    self.model_update_group.broadcast(values, src=0, stream=stream)
-+                patches.append(
-+                    CheckpointWeightPatch(
-+                        name=name,
-+                        shape=tuple(shape),
-+                        dtype=dtype,
-+                        values=values,
-+                        indices=indices,
-+                    )
-+                )
-+            # Every rank must consume every broadcast before selecting its PP
-+            # weights. Reuse the native model's missing-stage ownership rules.
-+            patches = [patch for patch in patches if not is_pp_missing_parameter(patch.name, self.model)]
-+            with checkpoint_loader_views(self.model):
-+                load_checkpoint_weight_patches(self.model, patches)
++                self.model_update_group.broadcast(values, src=0, stream=stream)
++            patches.append(CheckpointWeightPatch(name, tuple(shape), getattr(torch, dtype_name), values, indices))
++        return patches
 +
 +    def shutdown(self) -> None:
 +        if self.model_update_group is not None:
@@ -841,8 +856,7 @@ new file mode 100644
 +            raise ValueError("Sparse HCCL needs a trainer and at least one worker")
 +
 +        # Workers sit at rank_offset 1, after the single trainer sender rank 0.
-+        # Sparse transfers are never packed, so the worker keeps the unpacked
-+        # defaults on its init info.
++        # Sparse updates use one index/value broadcast pair per non-empty patch.
 +        worker_init_info = HCCLWeightTransferInitInfo(
 +            master_address=init_info.master_address,
 +            master_port=init_info.master_port,
@@ -866,7 +880,11 @@ new file mode 100644
 +        return engine
 +
 +    def _prepare_patches(self, patches: Iterable[SparseWeightPatch] | None) -> list[SparseWeightPatch]:
-+        prepared = super()._prepare_patches(patches)
++        self._profile = WeightTransferProfiler(
++            device=self.model_update_group.device if self.model_update_group else None
++        )
++        with self._profile.measure("sender_validate"):
++            prepared = super()._prepare_patches(patches)
 +        if not prepared:
 +            return []
 +        assert self.model_update_group is not None
@@ -882,6 +900,44 @@ new file mode 100644
 +                )
 +                for patch in prepared
 +            ]
++
++    def send_dense_weight_chunk(self, weights: list[tuple[str, torch.Tensor]]) -> None:
++        """Bootstrap with existing dense HCCL primitives on the same group.
++
++        The caller owns start/finish, as with send_weight_chunk. Dense public
++        checkpoint patches preserve native model loading without NaN staging.
++        """
++        if not self.is_sender or not weights:
++            return
++        assert self.model_update_group is not None
++        with torch.npu.device(self.model_update_group.device):
++            profile = WeightTransferProfiler(device=self.model_update_group.device)
++            with profile.measure("sender_normalize"):
++                weights = [
++                    (name, tensor.to(device=self.model_update_group.device).contiguous()) for name, tensor in weights
++                ]
++            info = SparseHCCLWeightTransferUpdateInfo(
++                names=[name for name, _ in weights],
++                dtype_names=[str(t.dtype).split(".")[-1] for _, t in weights],
++                shapes=[list(t.shape) for _, t in weights],
++                num_updates_list=[t.numel() for _, t in weights],
++                dense=True,
++            )
++            executor = ThreadPoolExecutor(max_workers=1)
++            try:
++                future = executor.submit(self.client.update_weights, asdict(info))
++                if future.done():
++                    future.result()
++                with profile.measure("sender_broadcast"):
++                    HCCLWeightTransferEngine.trainer_send_weights(
++                        iter(weights), HCCLTrainerSendWeightsArgs(group=self.model_update_group)
++                    )
++                with profile.measure("sender_wait_apply"):
++                    future.result()
++                profile.log(logging.getLogger(__name__), role="sender", dense=True)
++            finally:
++                executor.shutdown(wait=False, cancel_futures=True)
++            self._post_send_sync()
 +
 +    def _broadcast_chunk(self, patches: list[SparseWeightPatch]) -> None:
 +        assert self.model_update_group is not None
@@ -904,12 +960,16 @@ new file mode 100644
 +                if future.done():
 +                    future.result()
 +                stream = torch.npu.current_stream()
-+                for patch in patches:
-+                    if not patch.indices.numel():
-+                        continue
-+                    self.model_update_group.broadcast(patch.indices, src=0, stream=stream)
-+                    self.model_update_group.broadcast(patch.values, src=0, stream=stream)
-+                future.result()  # surface inference-side errors
++                profile = getattr(self, "_profile", WeightTransferProfiler(device=device))
++                with profile.measure("sender_broadcast"):
++                    for patch in patches:
++                        if patch.indices.numel():
++                            self.model_update_group.broadcast(patch.indices, src=0, stream=stream)
++                            self.model_update_group.broadcast(patch.values, src=0, stream=stream)
++                with profile.measure("sender_wait_apply"):
++                    future.result()
++                profile.log(logging.getLogger(__name__), role="sender")
++
 +            finally:
 +                # A failed broadcast can leave the RPC blocked in the matching
 +                # receive. Waiting for that thread would hide the original error.
@@ -986,7 +1046,7 @@ diff --git a/tests/ut/distributed/weight_transfer/test_sparse_hccl_engine.py b/t
 new file mode 100644
 --- /dev/null
 +++ b/tests/ut/distributed/weight_transfer/test_sparse_hccl_engine.py
-@@ -0,0 +1,277 @@
+@@ -0,0 +1,354 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Sparse HCCL validation, rank calculation, and lifecycle tests."""
@@ -1264,6 +1324,83 @@ new file mode 100644
 +def test_source_is_rejected():
 +    with pytest.raises(ValueError, match="WeightSource"):
 +        SparseHCCLTrainerWeightTransferEngine(client=MagicMock(), source=MagicMock())
++
++
++def test_dense_bootstrap_uses_values_only_and_public_dense_loader():
++    worker = make_worker()
++    worker.model_update_group = MagicMock(device=torch.device("cpu"))
++    info = SparseHCCLWeightTransferUpdateInfo(["checkpoint.weight"], ["float32"], [[4, 4]], [16], dense=True)
++    with (
++        patch("torch.npu.device", return_value=nullcontext()),
++        patch("torch.npu.current_stream"),
++        patch("vllm_ascend.distributed.weight_transfer.sparse_hccl_engine.load_checkpoint_weight_patches") as load,
++    ):
++        worker.receive_weights(info)
++    worker.model_update_group.broadcast.assert_called_once()
++    payload = load.call_args.args[1][0]
++    assert payload.indices is None and payload.values.numel() == 16
++    assert payload.shape == (4, 4)
++
++
++def test_dense_bootstrap_sender_reuses_hccl_primitive():
++    trainer = SparseHCCLTrainerWeightTransferEngine(client=MagicMock())
++    trainer.model_update_group = MagicMock(device=torch.device("cpu"))
++    weights = [("checkpoint.weight", torch.arange(16, dtype=torch.float32).view(4, 4))]
++    with (
++        patch("torch.npu.device", return_value=nullcontext()),
++        patch.object(trainer, "_post_send_sync"),
++        patch.object(HCCLWeightTransferEngine, "trainer_send_weights") as send,
++    ):
++        trainer.send_dense_weight_chunk(weights)
++    sent = list(send.call_args.args[0])
++    assert sent[0][0] == weights[0][0] and torch.equal(sent[0][1], weights[0][1])
++    assert send.call_args.args[1].group is trainer.model_update_group
++    info = trainer.client.update_weights.call_args.args[0]
++    assert info["dense"] is True and info["num_updates_list"] == [16]
++    trainer.client.start_weight_update.assert_not_called()
++    trainer.client.finish_weight_update.assert_not_called()
++
++
++@pytest.mark.parametrize("dense,count", [(True, 15), ("true", 16)])
++def test_bad_dense_metadata_rejected_before_collectives(dense, count):
++    with pytest.raises(ValueError):
++        SparseHCCLWeightTransferUpdateInfo(["checkpoint.weight"], ["float32"], [[4, 4]], [count], dense=dense)
++
++
++def test_sparse_roundtrip_preserves_mixed_dtypes_zero_entries_and_coordinates():
++    patches = [
++        make_patch(
++            name="a",
++            indices=torch.tensor([0, 3, 15], dtype=torch.int32),
++            values=torch.tensor([1.0, 2.0, 3.0], dtype=torch.float16),
++        ),
++        make_patch(name="b", values=torch.tensor([4.0, 5.0], dtype=torch.float32)),
++        make_patch(name="c", values=torch.tensor([6.0, 7.0], dtype=torch.float16)),
++        make_patch(name="empty", indices=torch.empty(0, dtype=torch.int32), values=torch.empty(0, dtype=torch.float16)),
++    ]
++    wire = []
++    trainer = SparseHCCLTrainerWeightTransferEngine(client=MagicMock())
++    trainer.model_update_group = MagicMock(device=torch.device("cpu"))
++    trainer.model_update_group.broadcast.side_effect = lambda tensor, **kw: wire.append(tensor.clone())
++    with patch("torch.npu.device", return_value=nullcontext()), patch("torch.npu.current_stream"):
++        trainer.send_weight_chunk(patches)
++    assert len(wire) == 6  # one index/value pair per non-empty patch
++    worker = make_worker()
++    worker.model_update_group = MagicMock(device=torch.device("cpu"))
++    worker.model_update_group.broadcast.side_effect = lambda tensor, **kw: tensor.copy_(wire.pop(0))
++    info = SparseHCCLWeightTransferUpdateInfo(**trainer.client.update_weights.call_args.args[0])
++    with (
++        patch("torch.npu.device", return_value=nullcontext()),
++        patch("torch.npu.current_stream"),
++        patch("vllm_ascend.distributed.weight_transfer.sparse_hccl_engine.load_checkpoint_weight_patches") as load,
++    ):
++        worker.receive_weights(info)
++    received = load.call_args.args[1]
++    assert not wire and len(received) == len(patches)
++    for original, actual in zip(patches, received, strict=True):
++        assert actual.name == original.name and actual.shape == original.full_shape
++        assert actual.values.dtype == original.values.dtype
++        assert torch.equal(actual.indices, original.indices) and torch.equal(actual.values, original.values)
 diff --git a/vllm_ascend/worker/worker.py b/vllm_ascend/worker/worker.py
 index b7df4df22..b8b9cfbb1 100644
 --- a/vllm_ascend/worker/worker.py
@@ -1548,7 +1685,7 @@ diff --git a/tests/e2e/pull_request/eight_card/test_sparse_hccl_checkpoint.py b/
 new file mode 100644
 --- /dev/null
 +++ b/tests/e2e/pull_request/eight_card/test_sparse_hccl_checkpoint.py
-@@ -0,0 +1,367 @@
+@@ -0,0 +1,406 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Real Qwen3 MoE loader oracle for checkpoint sparse HCCL (3/5 NPUs).
@@ -1601,7 +1738,7 @@ new file mode 100644
 +        return sock.getsockname()[1]
 +
 +
-+def write_checkpoint(path, num_layers=1):
++def write_checkpoint(path, num_layers=1, restore_original=False):
 +    path.mkdir()
 +    config = Qwen3MoeConfig(
 +        vocab_size=VOCAB_SIZE,
@@ -1653,6 +1790,28 @@ new file mode 100644
 +        for name, shape in shapes.items()
 +    }
 +    save_file(weights, path / "model.safetensors")
++    if restore_original:
++        # Keep an independent normal checkpoint; never derive the reference
++        # by replaying the sparse records under test.
++        torch.save(weights, path / "normal-reference.pt")
++        generator = torch.Generator().manual_seed(9876)
++        records = []
++        for name, weight in weights.items():
++            # Boundary positions cover every TP shard, PP stage and expert;
++            # random coordinates and signed changes add nontrivial coverage.
++            random_indices = torch.randint(weight.numel(), (17,), generator=generator)
++            boundaries = torch.tensor([0, weight.numel() - 1, *(weight.numel() * n // TP_SIZE for n in range(TP_SIZE))])
++            indices = torch.unique(torch.cat((random_indices, boundaries)), sorted=True)
++            normal = weight.flatten()[indices].clone()
++            changes = (torch.rand(indices.numel(), generator=generator) + 0.5) * 0.125
++            changes *= torch.where(torch.rand(indices.numel(), generator=generator) > 0.5, 1.0, -1.0)
++            base = (normal.float() - changes).to(weight.dtype)
++            assert torch.all(base != normal), name
++            weight.view(-1).index_copy_(0, indices, base)
++            records.append(dict(name=name, full_shape=tuple(weight.shape), indices=indices.to(torch.int32), values=normal))
++        save_file(weights, path / "model.safetensors")
++        torch.save(records, path / "patches.pt")
++        return
 +    records = []
 +    for name, weight in weights.items():
 +        # Touch each quarter and both ends, including every global expert owner.
@@ -1703,10 +1862,14 @@ new file mode 100644
 +
 +    @torch.no_grad()
 +    def sparse_dense_reference(self, model_path):
-+        weights = load_file(str(Path(model_path) / "model.safetensors"))
-+        records = torch.load(Path(model_path) / "patches.pt", weights_only=True)
-+        for record in records:
-+            weights[record["name"]].view(-1).index_copy_(0, record["indices"].long(), record["values"])
++        normal_path = Path(model_path) / "normal-reference.pt"
++        if normal_path.exists():
++            weights = torch.load(normal_path, weights_only=True)
++        else:
++            weights = load_file(str(Path(model_path) / "model.safetensors"))
++            records = torch.load(Path(model_path) / "patches.pt", weights_only=True)
++            for record in records:
++                weights[record["name"]].view(-1).index_copy_(0, record["indices"].long(), record["values"])
 +        with checkpoint_loader_views(self.get_model()):
 +            self.get_model().load_weights(weights.items())
 +        return self.sparse_digest()
@@ -1740,13 +1903,14 @@ new file mode 100644
 +    [(4, 1, 1), (2, 1, 2), (1, 2, 1), (2, 2, 1)],
 +    ids=["tp4-ep4", "tp2-dp2-ep4", "tp1-pp2-ep1", "tp2-pp2-ep2"],
 +)
-+def test_sparse_checkpoint_matches_native_dense(tmp_path, tp_size, pp_size, dp_size):
++@pytest.mark.parametrize("restore_original", [False, True], ids=["updated-reference", "restore-normal"])
++def test_sparse_checkpoint_matches_native_dense(tmp_path, tp_size, pp_size, dp_size, restore_original):
 +    """Compare every worker parameter and generated token with dense loading."""
 +    workers = tp_size * pp_size * dp_size
 +    if torch.npu.device_count() < workers + 1:
 +        pytest.skip(f"requires {workers + 1} NPUs (including a distinct trainer)")
 +    model_path = tmp_path / "checkpoint"
-+    write_checkpoint(model_path, num_layers=pp_size)
++    write_checkpoint(model_path, num_layers=pp_size, restore_original=restore_original)
 +    port = free_port()
 +    url = f"http://127.0.0.1:{port}"
 +    environment = os.environ.copy()
@@ -1828,6 +1992,12 @@ new file mode 100644
 +                init_info=SparseHCCLTrainerInitInfo("127.0.0.1", free_port(), workers + 1, rank=0), client=client
 +            )
 +            records = torch.load(model_path / "patches.pt", weights_only=True)
++            # Replacing the modified reference with the original checkpoint
++            # exercises dense bootstrap on already-transposed runtime weights.
++            client.start_weight_update()
++            engine.send_dense_weight_chunk(list(load_file(str(model_path / "model.safetensors")).items()))
++            client.finish_weight_update()
++            assert rpc(url, "sparse_digest") == baseline
 +            client.start_weight_update()
 +            for offset in range(0, len(records), 4):
 +                engine.send_weight_chunk(SparseWeightPatch(**r) for r in records[offset : offset + 4])
@@ -1839,6 +2009,7 @@ new file mode 100644
 +            assert [(c["token_ids"], c["finish_reason"]) for c in actual] == [
 +                (c["token_ids"], c["finish_reason"]) for c in expected
 +            ]
++            requests.post(f"{url}/pause", timeout=60).raise_for_status()
 +            (tmp_path / "validation.json").write_text(
 +                json.dumps(
 +                    {
@@ -1850,6 +2021,11 @@ new file mode 100644
 +                        "runtime_hashes": reference,
 +                        "generation": [(c["token_ids"], c["finish_reason"]) for c in actual],
 +                        "all_rank_hashes_equal": True,
++                        "dense_seed_and_sparse_restore": True,
++                        "restores_independent_normal_checkpoint": restore_original,
++                        "reference_token_ids": [c["token_ids"] for c in expected],
++                        "perturbed_baseline_hashes": baseline if restore_original else None,
++                        "sparse_updates": sum(record["indices"].numel() for record in records),
 +                    },
 +                    indent=2,
 +                )

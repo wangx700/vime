@@ -119,6 +119,30 @@ def _compare_sparse_with_full_weights(model, cfg_dir, rank):
         return {name: weight.detach().cpu().clone() for chunk in iterator.get_hf_weight_chunks() for name, weight in chunk}
 
     accumulated = export()
+    # Reuse both real exporters on the same live shards before any mutation.
+    # The fixed tiny checkpoint above has these exact model dimensions.
+    from vime.backends.megatron_utils.update_weight.common import named_params_and_buffers
+    from vime.backends.megatron_utils.update_weight.hf_weight_iterator_direct import HfWeightIteratorDirect
+
+    direct_args = SimpleNamespace(
+        update_weight_buffer_size=4096, num_experts=4, vocab_size=512,
+        hidden_size=64, num_attention_heads=4, num_query_groups=2, kv_channels=16,
+    )
+    direct = HfWeightIteratorDirect(direct_args, model, "qwen3moe", None)
+    local_weights = dict(named_params_and_buffers(direct_args, model))
+    direct_weights = {}
+    for chunk in direct.get_hf_weight_chunks(local_weights):
+        for name, weight in chunk:
+            assert name not in direct_weights, f"Duplicate Direct export: {name}"
+            direct_weights[name] = weight.detach().cpu().contiguous().clone()
+    assert direct_weights.keys() == accumulated.keys()
+    for name, expected_weight in accumulated.items():
+        actual_weight = direct_weights[name]
+        assert actual_weight.dtype == expected_weight.dtype and actual_weight.shape == expected_weight.shape, name
+        assert torch.equal(actual_weight.view(torch.uint8), expected_weight.contiguous().view(torch.uint8)), name
+    if rank == 0:
+        print(f"DIRECT VS BRIDGE PASS: tensors={len(direct_weights)} bitwise_equal=True", flush=True)
+    del direct_weights, direct, local_weights
     snapshots = {}
     prime_delta_snapshots(index, snapshots, pin=False)
     torch.npu.synchronize()
@@ -277,6 +301,9 @@ def _distributed_worker(rank, port, cfg_dir):
     torch.npu.set_device(rank)
     store = dist.TCPStore("127.0.0.1", port, is_master=False, timeout=timedelta(seconds=120))
     dist.init_process_group("hccl", store=store, rank=rank, world_size=TP * PP, timeout=timedelta(seconds=120))
+    from vime.utils.distributed_utils import init_gloo_group
+
+    init_gloo_group()
     try:
         _run_gather_regression()
         _run_sparse_full_comparison(rank, cfg_dir)
@@ -496,24 +523,48 @@ def test_native_bucket_preserves_checkpoint_coordinates_when_split():
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize("capacity,expected_flushes", [(16, 4), (64, 1)])
-def test_native_full_index_seed_reconstructs_each_checkpoint_tensor(monkeypatch, capacity, expected_flushes):
+@pytest.mark.parametrize("capacity,expected_flushes", [(16, 2), (64, 1)])
+def test_native_dense_seed_reuses_complete_checkpoint_chunks(monkeypatch, capacity, expected_flushes):
     instance = updater_module.UpdateWeightFromSparseHCCL.__new__(updater_module.UpdateWeightFromSparseHCCL)
     expected = {"weight": torch.arange(6, dtype=torch.float32).reshape(2, 3), "bias": torch.tensor([3.0, 5.0])}
     instance.args = SimpleNamespace(update_weight_buffer_size=capacity)
-    instance._iterator = SimpleNamespace(get_hf_weight_chunks=lambda *a, **kw: iter([list(expected.items())]))
+    chunks = [[item] for item in expected.items()] if capacity == 16 else [list(expected.items())]
+    instance._seed_iterator = SimpleNamespace(get_hf_weight_chunks=lambda *a, **kw: iter(chunks))
+    instance._iterator = SimpleNamespace(get_hf_weight_chunks=lambda *a, **kw: pytest.fail("seed must reuse the full exporter"))
     instance.weights_getter = lambda: {}
     sent = []
-    instance._publish_flush = lambda patches: sent.append(list(patches))
+    instance._trainer = SimpleNamespace(send_dense_weight_chunk=lambda weights: sent.append(list(weights)))
+    instance._payload_started = False
     monkeypatch.setattr(updater_module.dist, "get_rank", lambda: 0)
+    monkeypatch.setattr(updater_module.torch, "arange", lambda *a, **kw: pytest.fail("dense seed must not allocate indices"))
     flushes, wire = instance._send_dense()
-    actual = {name: torch.full_like(tensor, float("nan")) for name, tensor in expected.items()}
-    for chunk in sent:
-        for patch in chunk:
-            assert patch.full_shape == tuple(expected[patch.name].shape)
-            actual[patch.name].view(-1).index_copy_(0, patch.indices.long(), patch.values)
-    assert flushes == len(sent) == expected_flushes and wire == 8 * (4 + 4)
+    actual = dict(item for chunk in sent for item in chunk)
+    assert flushes == len(sent) == expected_flushes and wire == 8 * 4
+    assert instance._payload_started
     assert all(torch.equal(actual[name], tensor) for name, tensor in expected.items())
+
+
+@pytest.mark.unit
+def test_dense_seed_initializes_full_exporter_on_non_wire_rank(monkeypatch):
+    instance = updater_module.UpdateWeightFromSparseHCCL.__new__(updater_module.UpdateWeightFromSparseHCCL)
+    instance.args = SimpleNamespace()
+    instance.model = []
+    instance.model_name = "qwen3"
+    instance.quantization_config = None
+    instance._seed_iterator = None
+    weights = {}
+    instance.weights_getter = lambda: weights
+    calls = []
+
+    def create(**kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(get_hf_weight_chunks=lambda received, **kw: iter([]) if received is weights else pytest.fail("wrong weight source"))
+
+    monkeypatch.setattr(updater_module, "HfWeightIteratorDirect", create)
+    monkeypatch.setattr(updater_module.dist, "get_rank", lambda: 1)
+    assert instance._send_dense() == (0, 0)
+    assert instance._send_dense() == (0, 0)
+    assert calls == [dict(args=instance.args, model=instance.model, model_name="qwen3", quantization_config=None)]
 
 
 @pytest.mark.unit

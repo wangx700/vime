@@ -11,6 +11,7 @@ from math import prod
 import ray
 import torch
 import torch.distributed as dist
+from vllm.distributed.weight_transfer.profiling import WeightTransferProfiler
 from ray.actor import ActorHandle
 from vllm.distributed.weight_transfer.sparse_nccl_engine import SparseWeightPatch
 from vllm_ascend.distributed.weight_transfer.sparse_hccl_engine import (
@@ -23,6 +24,7 @@ from vime.utils.distributed_utils import get_gloo_group
 from .common import VimeRayWeightSyncClient
 from .delta_sync import gather_slot_entries_to_rank0
 from .delta_sync.sparse_gather import GatherWorkspace
+from .hf_weight_iterator_direct import HfWeightIteratorDirect
 from .hf_weight_iterator_sparse_bridge import HfWeightIteratorSparseBridge
 from .megatron_delta_export import (
     build_export_index,
@@ -165,6 +167,7 @@ class UpdateWeightFromSparseHCCL:
         self.weight_version = 0
         self.update_weight_metrics: dict[str, float] = {}
         self._iterator = HfWeightIteratorSparseBridge(args, model)
+        self._seed_iterator = None
         self._index = None
         self._snapshots: dict[str, torch.Tensor] = {}
         self._seeded = False
@@ -312,38 +315,34 @@ class UpdateWeightFromSparseHCCL:
         self._trainer.send_weight_chunk(patches)
 
     def _send_dense(self) -> tuple[int, int]:
-        """Seed all values using the native sparse protocol, without a wire extension.
+        """Bootstrap full checkpoint values without indices or NaN staging.
 
-        Complete checkpoint indices cost more wire bytes than dense HCCL. Bound
-        allocations by the configured buffer and report seed separately.
+        Reuse the full updater's existing exporter. Bridge remains responsible
+        for the sparse export index; neither exporter implementation changes.
         """
         statistics = {"flushes": 0, "wire_bytes": 0}
-
-        def publish(patches):
-            self._publish_flush(patches)
-            statistics["flushes"] += 1
-            statistics["wire_bytes"] += sum(patch.indices.numel() * (4 + patch.values.element_size()) for patch in patches)
-
-        bucket = _SparseFlushBucket(self.args.update_weight_buffer_size, publish)
-        for chunk in self._iterator.get_hf_weight_chunks(self.weights_getter(), progress_desc="Native sparse HCCL full-index seed"):
-            if dist.get_rank() != 0:
+        if self._seed_iterator is None:
+            # Construction gathers parameter metadata collectively. Every
+            # training rank must participate, including non-wire ranks.
+            self._seed_iterator = HfWeightIteratorDirect(
+                args=self.args,
+                model=self.model,
+                model_name=self.model_name,
+                quantization_config=self.quantization_config,
+            )
+        for chunk in self._seed_iterator.get_hf_weight_chunks(self.weights_getter(), progress_desc="Dense HCCL seed"):
+            if dist.get_rank() != 0 or not chunk:
                 continue
-            for name, tensor in chunk:
-                flat = tensor.detach().contiguous().view(-1)
-                if flat.numel() > torch.iinfo(torch.int32).max + 1:
-                    raise ValueError(f"Native int32 checkpoint coordinates cannot represent all seed indices: {name}")
-                count = max(self.args.update_weight_buffer_size // (4 + flat.element_size()), 1)
-                for start in range(0, flat.numel(), count):
-                    end = min(start + count, flat.numel())
-                    indices = torch.arange(start, end, dtype=torch.int32, device=flat.device)
-                    bucket.add(name, tuple(tensor.shape), indices, flat[start:end])
-            # Batch small tensors through the native list API while releasing
-            # all exported tensor references before the next Bridge chunk.
-            bucket.flush()
+            self._payload_started = True
+            assert self._trainer is not None
+            self._trainer.send_dense_weight_chunk(chunk)
+            statistics["flushes"] += 1
+            statistics["wire_bytes"] += sum(tensor.numel() * tensor.element_size() for _, tensor in chunk)
         return statistics["flushes"], statistics["wire_bytes"]
 
     def _send_sparse_delta(self) -> tuple[int, int, int]:
         assert self._index is not None
+        profile = self._profile
         statistics = {"flushes": 0, "wire_bytes": 0, "updates": 0}
 
         def publish(patches):
@@ -372,16 +371,27 @@ class UpdateWeightFromSparseHCCL:
             consume,
             workspaces=self._gather_workspaces,
         )
-        for slots, dtype_name, counts, indices, values, group in iter_delta_entries(
-            self._index,
-            self._snapshots,
-            batch_size=getattr(self.args, "update_weight_delta_batch_diff", 32),
-        ):
-            queue.put(group, slots, dtype_name, counts, indices, values)
-        queue.flush_all()
+        entries = iter(
+            iter_delta_entries(
+                self._index,
+                self._snapshots,
+                batch_size=getattr(self.args, "update_weight_delta_batch_diff", 32),
+            )
+        )
+        while True:
+            with profile.measure("trainer_diff_export_snapshot"):
+                try:
+                    slots, dtype_name, counts, indices, values, group = next(entries)
+                except StopIteration:
+                    break
+            with profile.measure("trainer_gather_publish_inclusive"):
+                queue.put(group, slots, dtype_name, counts, indices, values)
+        with profile.measure("trainer_gather_publish_inclusive"):
+            queue.flush_all()
         if dist.get_rank() == 0:
             for bucket in buckets.values():
-                bucket.flush()
+                with profile.measure("trainer_publish_tail"):
+                    bucket.flush()
         return statistics["flushes"], statistics["wire_bytes"], statistics["updates"]
 
     @torch.no_grad()
@@ -393,10 +403,12 @@ class UpdateWeightFromSparseHCCL:
         if getattr(self, "_needs_reconnect", False):
             self.connect_rollout_engines(self.rollout_engines, None, engine_gpu_counts=self._engine_gpu_counts)
         self.weight_version += 1
+        self._profile = WeightTransferProfiler(device="npu")
         self._payload_started = False
         begin_error: BaseException | None = None
         try:
-            self._begin_update()
+            with self._profile.measure("trainer_begin"):
+                self._begin_update()
         except BaseException as error:
             begin_error = error
         failed, _ = self._sync_update_state(begin_error)
@@ -407,17 +419,17 @@ class UpdateWeightFromSparseHCCL:
 
         phase_error: BaseException | None = None
         try:
-            self._ensure_export_index()
-            validate_export_weights(self._index)
+            with self._profile.measure("trainer_index"):
+                self._ensure_export_index()
+            with self._profile.measure("trainer_validate"):
+                validate_export_weights(self._index)
             if not self._seeded:
-                flushes, wire_bytes = self._send_dense()
+                with self._profile.measure("trainer_seed_export_send"):
+                    flushes, wire_bytes = self._send_dense()
                 assert self._index is not None
-                prime_delta_snapshots(
-                    self._index,
-                    self._snapshots,
-                    pin=True,
-                )
-                torch.accelerator.synchronize()
+                with self._profile.measure("trainer_seed_snapshot"):
+                    prime_delta_snapshots(self._index, self._snapshots, pin=True)
+                    torch.accelerator.synchronize()
                 updates = sum(prod(shape) for record in self._index for _name, shape in record.slots or [])
                 self._seeded = True
             else:
@@ -439,7 +451,8 @@ class UpdateWeightFromSparseHCCL:
 
         finish_error: BaseException | None = None
         try:
-            self._finish_update()
+            with self._profile.measure("trainer_finish"):
+                self._finish_update()
         except BaseException as error:
             finish_error = error
         failed, _ = self._sync_update_state(finish_error)
@@ -448,6 +461,7 @@ class UpdateWeightFromSparseHCCL:
             if dist.get_rank() == 0:
                 logger.error("Sparse HCCL finish failed after weights were applied; generation may remain paused and the updater must not be reused")
             self._raise_synchronized_error(finish_error, "finish")
+        self._profile.log(logger, role="trainer", rank=dist.get_rank(), version=self.weight_version)
         if dist.get_rank() == 0:
             self.update_weight_metrics = {
                 "perf/update_weights_sparse_hccl_wire_mbytes": wire_bytes / (1024**2),

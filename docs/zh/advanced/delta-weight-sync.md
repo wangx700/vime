@@ -3,8 +3,8 @@
 Delta 权重同步只发送两次同步之间发生变化的字节，而不是每次都写一份完整 checkpoint，以此让非 colocate 的 rollout engine 保持最新。它面向大模型、跨集群或跨数据中心的训推解耦场景——这种场景下每次都写整份 actor 权重是主要开销。
 
 它支持两条传输路径：`disk` 面向跨集群共享存储，`sparse_hccl` 面向 Ascend
-训练和 vLLM-Ascend rollout 之间的在线传输。`sparse_hccl` 首次通过原生协议发送完整
-int32 索引和值，后续通过相同协议仅发送变化位置的索引和值。
+训练和 vLLM-Ascend rollout 之间的在线传输。`sparse_hccl` 首次通过 dense HCCL 发送完整值，
+后续在同一通信组中仅发送变化位置的索引和值。
 
 ## 配置
 
@@ -60,11 +60,33 @@ delta 始终用 zstd（level 1）压缩；profiling 显示对这类数据它在 
 
 ### Sparse HCCL
 
-1. 首次通过 Megatron→HF 全量导出流发送有界的 index/value patch，覆盖 checkpoint 的所有位置。完成后才将各 rank 的本地 Megatron shard snapshot 保存在主机内存。BF16 初始化每个元素占六字节 payload，应与稳态同步分别计时。
+1. 首次由同步适配层复用 full 模式已有的 `HfWeightIteratorDirect`，通过现有 dense HCCL 发送函数和公共 dense checkpoint loader 传输完整 Megatron→HF 导出值，不生成索引或 NaN staging。所有训练 rank 参与导出，只有 rank 0 发送。Bridge 继续用于增量索引，不修改两种导出器的实现；这与 MoE 直写无关。完成后才将各 rank 的本地 Megatron shard snapshot 保存在主机内存。
 2. 后续同步在每个 rank 上对当前 shard 和 snapshot 做整数视图的 bit-exact diff，并立即推进 snapshot。
 3. NaN probe 把本地变化映射成最终 HF 参数名和全局 flat index。PP 非 owner、DP/CP 重复副本和无变化 rank 仍发送 count=0 的目录行。
 4. TP、EP/ETP、PP/VPP 按统一目录执行 batched variable-length gather；wire master 构造公共 `SparseWeightPatch`，通过 `send_weight_chunk` 发送有界列表。
 5. 接收端校验 checkpoint patch，并通过原生 weight loader 原地更新 live weights。该协议不增加 checksum 元数据或 MoE 直写；独立正确性测试将重建结果与 full export 比较，并将接收端完整参数摘要与 dense 加载比较。发生可能部分写入的失败后，updater 在恢复前不可复用。
+
+所有 PP worker 都消费完整广播后再过滤本 stage 参数。镜像中的两份依赖 patch 必须配套安装。
+
+恢复正常权重的端到端用例位于依赖 patch 中的
+`tests/e2e/pull_request/eight_card/test_sparse_hccl_checkpoint.py`。
+在已安装配套依赖的 vllm-ascend 目录运行：
+
+```bash
+pytest -s tests/e2e/pull_request/eight_card/test_sparse_hccl_checkpoint.py -k 'restore-normal and tp2-pp2-ep2'
+```
+
+该用例需要五张空闲 NPU（一个发送端、四个 TP2/PP2/EP2 接收 worker）。
+它保存独立正常 checkpoint，在随机位置及分片边界用随机变化量构造扰动基础模型，
+通过 sparse HCCL 恢复后，要求所有 worker 的完整参数摘要及确定性生成 token 与正常模型一致。
+稀疏传输仅使用非 packed 路径。`SparseWeightPatch.values` 是变更位置的目标值，
+不是待相加的差值；因此发送正常 checkpoint 的对应值，避免 BF16 减后再加的舍入误差。
+此用例使用小型合成 Qwen3-MoE 验证协议与映射正确性，不表示预训练模型精度或性能结论。
+
+单独进行耗时归因时，在 trainer 和 rollout worker 环境中设置 `VLLM_WEIGHT_TRANSFER_PROFILE=1`。
+`WEIGHT_TRANSFER_PROFILE` 按阶段和 rank 记录累计秒数、调用次数。计时会同步设备，性能对照应关闭计时重新运行。
+父阶段包含子阶段，不能直接相加；跨 rank 应分析关键路径上的最大耗时，不能累加所有 worker 的时间。
+`receiver_apply` 等待设备工作完成；内部以 `_host_dispatch` 结尾的逐参数阶段只记录主机停留时间（包括隐式等待），不额外同步设备，也不代表单独的 kernel 执行时间。
 
 ### 磁盘传输
 
