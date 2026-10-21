@@ -64,7 +64,13 @@ delta 始终用 zstd（level 1）压缩；profiling 显示对这类数据它在 
 2. 后续同步在每个 rank 上对当前 shard 和 snapshot 做整数视图的 bit-exact diff，并立即推进 snapshot。
 3. NaN probe 把本地变化映射成最终 HF 参数名和全局 flat index。PP 非 owner、DP/CP 重复副本和无变化 rank 仍发送 count=0 的目录行。
 4. TP、EP/ETP、PP/VPP 按统一目录执行 batched variable-length gather；wire master 构造公共 `SparseWeightPatch`，通过 `send_weight_chunk` 发送有界列表。
-5. 接收端校验 checkpoint patch，并通过原生 weight loader 原地更新 live weights。该协议不增加 checksum 元数据或 MoE 直写；独立正确性测试将重建结果与 full export 比较，并将接收端完整参数摘要与 dense 加载比较。发生可能部分写入的失败后，updater 在恢复前不可复用。
+5. 接收端校验 checkpoint patch，并通过原生 weight loader 原地更新 live weights。独立正确性测试将重建结果与 full export 比较，并将接收端完整参数摘要与 dense 加载比较。发生可能部分写入的失败后，updater 在恢复前不可复用。
+
+在 rollout worker 环境中设置 `VIME_SPARSE_MOE_DIRECT=1` 可启用 Qwen3-MoE
+直写，默认关闭。公共校验通过后，支持的 BF16/ND 静态 EP 专家 patch 按 runtime
+`w13`/`w2` 参数分组，在推理布局下直接写入，避免完整形状的 NaN staging，并跳过
+非本地专家。其他参数及不支持的布局继续走原生 loader，仅回退加载时进入临时转置视图。
+首次 dense seed、线上传输内容、发送端校验和训练侧 diff/gather 保持原流程。
 
 所有 PP worker 都消费完整广播后再过滤本 stage 参数。镜像中的两份依赖 patch 必须配套安装。
 

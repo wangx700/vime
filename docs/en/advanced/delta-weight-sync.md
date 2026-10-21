@@ -71,7 +71,15 @@ Deltas are always zstd-compressed (level 1); profiling showed it dominates lz4 /
 2. Later syncs bit-diff each current shard against its snapshot through an integer view, then advance the snapshot immediately.
 3. A NaN probe maps local changes to final HF names and global flat indices. PP non-owners, DP/CP replicas, and unchanged ranks retain zero-count lockstep directory rows.
 4. TP, EP/ETP, and PP/VPP ranks execute batched variable-length gathers over one common directory. The wire master constructs public `SparseWeightPatch` objects and sends bounded lists through `send_weight_chunk`.
-5. The receiver validates checkpoint patches and uses native weight loaders to update live weights in place. This protocol adds neither checksum metadata nor MoE direct writes. Independent correctness tests compare reconstructed/full exports and receiver parameter hashes against dense loading. A potentially partial update failure prevents updater reuse until recovery.
+5. The receiver validates checkpoint patches and uses native weight loaders to update live weights in place. Independent correctness tests compare reconstructed/full exports and receiver parameter hashes against dense loading. A potentially partial update failure prevents updater reuse until recovery.
+
+Set `VIME_SPARSE_MOE_DIRECT=1` in rollout worker environments to enable optional
+Qwen3-MoE direct writes (default: disabled). After common validation, supported
+BF16/ND static-EP expert patches are grouped by runtime `w13`/`w2` parameter and
+written in inference layout. This avoids full-shape NaN staging and skips
+nonlocal experts. Other parameters and unsupported layouts retain native loading;
+temporary loader transpose views are entered only for that fallback. Dense seed,
+wire payloads, sender validation, and training diff/gather are unchanged.
 
 Sparse transport uses the non-packed path. Every PP worker consumes all broadcasts before
 filtering its parameters. Both image dependency patches must be installed together.

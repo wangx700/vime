@@ -3,9 +3,11 @@
 This guide provides instructions for installing Vime with NPU support, including the required dependencies and patches.
 
 Sparse HCCL uses the public trainer and checkpoint-loading APIs.
-Initialization sends complete index/value patches before steady sparse updates.
-No packed sparse transport, MoE direct write or receiver checksum/verify extension
-is added; native sparse runs require `--update-weight-delta-verify-every 0`.
+Initialization reuses full export and dense HCCL before steady sparse updates.
+Set `VIME_SPARSE_MOE_DIRECT=1` in rollout workers to enable guarded Qwen3-MoE
+BF16/ND direct writes; the default is disabled and unsupported layouts retain
+native checkpoint loading. Sparse transport is non-packed and runs require
+`--update-weight-delta-verify-every 0`.
 
 ## Component Version Mapping
 
@@ -19,6 +21,9 @@ is added; native sparse runs require `--update-weight-delta-verify-every 0`.
 | TransformerEngineNPU | `d743c83d060d5edc48867ecb9e93ec80d81860e4` | [GitCode](https://gitcode.com/Ascend/TransformerEngineNPU) |
 | MindSpeed | `fc63de5c48426dd019c3b3f39e65f5bdf56e4086` | [GitCode](https://gitcode.com/Ascend/MindSpeed) |
 | torch_memory_saver (NPU) | `sgl-kernel-npu` tag `2026.6.0` | [GitHub](https://github.com/sgl-project/sgl-kernel-npu) |
+
+Table note: these are the pinned installation versions; the base-image entry
+does not identify the migrated container used for performance experiments.
 
 ## Preparing the Running Environment
 
