@@ -8,6 +8,11 @@ Set `VIME_SPARSE_MOE_DIRECT=1` in rollout workers to enable guarded Qwen3-MoE
 BF16/ND direct writes; the default is disabled and unsupported layouts retain
 native checkpoint loading. Sparse transport is non-packed and runs require
 `--update-weight-delta-verify-every 0`.
+Sender validation retains shape, dtype, bounds, duplicate-index and NaN checks.
+Ascend aggregates numeric error flags on each device before reading a result
+per chunk; invalid payloads are rejected before starting worker RPCs or HCCL.
+This is an internal implementation change: the public #18915 trainer methods,
+patch types and transport metadata remain unchanged.
 
 ## Component Version Mapping
 
