@@ -633,3 +633,366 @@ index 0000000000..42be58d249
 +        )
 +    _write_applied_version(local_checkpoint_dir, version)
 +
+diff --git a/vllm/distributed/weight_transfer/profiling.py b/vllm/distributed/weight_transfer/profiling.py
+new file mode 100644
+--- /dev/null
++++ b/vllm/distributed/weight_transfer/profiling.py
+@@ -0,0 +1,73 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Opt-in, synchronized weight-transfer phase diagnostics.
++
++Profiling inserts device synchronization and is intended for attribution runs,
++not throughput claims. Disabled instrumentation never synchronizes the device.
++Nested/inclusive phases must not be summed together.
++Per-tensor host observers deliberately avoid device synchronization; their
++``_host_dispatch`` suffix distinguishes them from completed device phases.
++"""
++
++import json
++import os
++from collections import defaultdict
++from contextlib import contextmanager
++from time import perf_counter
++
++import torch
++
++
++class WeightTransferProfiler:
++    def __init__(self, *, device=None):
++        self.enabled = os.environ.get("VLLM_WEIGHT_TRANSFER_PROFILE", "0") == "1"
++        self.device = device
++        self.seconds = defaultdict(float)
++        self.calls = defaultdict(int)
++
++    def _synchronize(self):
++        if self.device is not None and torch.device(self.device).type != "cpu":
++            torch.accelerator.synchronize()
++
++    @contextmanager
++    def measure(self, phase):
++        if not self.enabled:
++            yield
++            return
++        self._synchronize()
++        start = perf_counter()
++        try:
++            yield
++        finally:
++            self._synchronize()
++            self.seconds[phase] += perf_counter() - start
++            self.calls[phase] += 1
++
++    @contextmanager
++    def measure_host(self, phase):
++        """Record host residence, including implicit waits, without extra sync.
++
++        Use inside an outer synchronized phase for per-tensor staging/loading.
++        This is not isolated device execution time and must not be added to
++        the containing completed-device phase.
++        """
++        if not self.enabled:
++            yield
++            return
++        start = perf_counter()
++        try:
++            yield
++        finally:
++            phase = f"{phase}_host_dispatch"
++            self.seconds[phase] += perf_counter() - start
++            self.calls[phase] += 1
++
++    def log(self, logger, **identity):
++        if self.enabled:
++            logger.info(
++                "WEIGHT_TRANSFER_PROFILE %s",
++                json.dumps(
++                    dict(identity, seconds=dict(self.seconds), calls=dict(self.calls)),
++                    sort_keys=True,
++                ),
++            )
+diff --git a/vllm/model_executor/model_loader/checkpoint_weight_patch.py b/vllm/model_executor/model_loader/checkpoint_weight_patch.py
+--- a/vllm/model_executor/model_loader/checkpoint_weight_patch.py
++++ b/vllm/model_executor/model_loader/checkpoint_weight_patch.py
+@@ -13,6 +13,7 @@
+ 
+ import math
+ from collections.abc import Iterable
++from contextlib import nullcontext
+ from typing import NamedTuple
+ 
+ import torch
+@@ -142,6 +143,7 @@
+     *,
+     max_chunk_bytes: int = _DEFAULT_PATCH_CHUNK_BYTES,
+     validate_unique_indices: bool = True,
++    phase_observer=None,
+ ) -> set[str]:
+     """Load ordered patches through the model's checkpoint loader.
+ 
+@@ -173,6 +175,8 @@
+             each patch. Repeated patches may update the same positions. Disable
+             only for a trusted producer that already guarantees unique positions
+             within each patch.
++        phase_observer: Optional context-manager factory receiving a phase name
++            for diagnostic timing. No device synchronization is added by default.
+ 
+     Returns:
+         Union of the weight names reported by all ``model.load_weights`` calls.
+@@ -181,6 +185,7 @@
+     if max_chunk_bytes <= 0:
+         raise ValueError("max_chunk_bytes must be positive")
+ 
++    observe = phase_observer or (lambda _phase: nullcontext())
+     patch_list = list(patches)
+     patch_numels = [_validate_patch_structure(patch) for patch in patch_list]
+     # All patches in one call must use the same dense or sparse representation.
+@@ -189,39 +194,44 @@
+         raise ValueError("Dense and sparse checkpoint patches cannot be mixed")
+     sparse = sparse_flags == {True}
+ 
+-    # Keep validation results on their devices and read one combined result per
+-    # device, instead of synchronizing the CPU once for every patch.
+-    checks_by_device: dict[torch.device, list[torch.Tensor]] = {}
+-    if sparse:
+-        for patch, numel in zip(patch_list, patch_numels, strict=True):
+-            assert patch.indices is not None
+-
+-            # NaN is reserved to mean "leave this checkpoint position unchanged,"
+-            # so it cannot also be supplied as a new sparse value.
+-            patch_checks = [torch.isnan(patch.values).any()]
+-            indices = patch.indices.to(device=patch.values.device)
+-            if indices.numel():
+-                # Sparse indices address the flattened full checkpoint tensor.
+-                patch_checks.append(
+-                    torch.logical_or(indices < 0, indices >= numel).any()
++    with observe("receiver_validate"):
++        # Keep validation results on their devices and read one combined result per
++        # device, instead of synchronizing the CPU once for every patch.
++        checks_by_device: dict[torch.device, list[torch.Tensor]] = {}
++        if sparse:
++            for patch, numel in zip(patch_list, patch_numels, strict=True):
++                assert patch.indices is not None
++
++                # NaN is reserved to mean "leave this checkpoint position unchanged,"
++                # so it cannot also be supplied as a new sparse value.
++                patch_checks = [torch.isnan(patch.values).any()]
++                indices = patch.indices.to(device=patch.values.device)
++                if indices.numel():
++                    # Sparse indices address the flattened full checkpoint tensor.
++                    patch_checks.append(
++                        torch.logical_or(indices < 0, indices >= numel).any()
++                    )
++                    if validate_unique_indices:
++                        # Equal neighboring indices after sorting indicate duplicates.
++                        sorted_indices = torch.sort(indices).values
++                        patch_checks.append(
++                            (sorted_indices[1:] == sorted_indices[:-1]).any()
++                        )
++
++                checks_by_device.setdefault(patch.values.device, []).extend(
++                    patch_checks
+                 )
+-                if validate_unique_indices:
+-                    # Equal neighboring indices after sorting indicate duplicates.
+-                    sorted_indices = torch.sort(indices).values
+-                    patch_checks.append(
+-                        (sorted_indices[1:] == sorted_indices[:-1]).any()
+-                    )
+-
+-            checks_by_device.setdefault(patch.values.device, []).extend(patch_checks)
+-
+-        for device_checks in checks_by_device.values():
+-            if torch.stack(device_checks).any().item():
+-                invalid_reasons = (
+-                    "NaN values, out-of-range indices, or duplicate indices"
+-                    if validate_unique_indices
+-                    else "NaN values or out-of-range indices"
+-                )
+-                raise ValueError(f"Sparse checkpoint patches contain {invalid_reasons}")
++
++            for device_checks in checks_by_device.values():
++                if torch.stack(device_checks).any().item():
++                    invalid_reasons = (
++                        "NaN values, out-of-range indices, or duplicate indices"
++                        if validate_unique_indices
++                        else "NaN values or out-of-range indices"
++                    )
++                    raise ValueError(
++                        f"Sparse checkpoint patches contain {invalid_reasons}"
++                    )
+ 
+     loaded_names: set[str] = set()
+     # Collect checkpoint tensors for one model.load_weights() call.
+@@ -240,34 +250,39 @@
+             chunk_bytes + checkpoint_tensor_bytes > max_chunk_bytes
+             or patch.name in chunk_names
+         ):
+-            loaded_names.update(_load_weight_chunk(model, weight_chunk, sparse=sparse))
++            with observe("receiver_load"):
++                loaded_names.update(
++                    _load_weight_chunk(model, weight_chunk, sparse=sparse)
++                )
+             weight_chunk = []
+             chunk_names = set()
+             chunk_bytes = 0
+ 
+-        if patch.indices is None:
+-            checkpoint_tensor = patch.values.to(dtype=patch.dtype).view(patch.shape)
+-        else:
+-            # NaNs mark unchanged checkpoint positions; index_copy_ fills only
+-            # the positions supplied by this sparse patch.
+-            flat = torch.full(
+-                (numel,),
+-                float("nan"),
+-                dtype=patch.dtype,
+-                device=patch.values.device,
+-            )
+-            if patch.values.numel():
+-                flat.index_copy_(
+-                    0,
+-                    patch.indices.to(device=flat.device, dtype=torch.long),
+-                    patch.values.to(dtype=patch.dtype, device=flat.device),
++        with observe("receiver_staging"):
++            if patch.indices is None:
++                checkpoint_tensor = patch.values.to(dtype=patch.dtype).view(patch.shape)
++            else:
++                # NaNs mark unchanged checkpoint positions; index_copy_ fills only
++                # the positions supplied by this sparse patch.
++                flat = torch.full(
++                    (numel,),
++                    float("nan"),
++                    dtype=patch.dtype,
++                    device=patch.values.device,
+                 )
+-            checkpoint_tensor = flat.view(patch.shape)
++                if patch.values.numel():
++                    flat.index_copy_(
++                        0,
++                        patch.indices.to(device=flat.device, dtype=torch.long),
++                        patch.values.to(dtype=patch.dtype, device=flat.device),
++                    )
++                checkpoint_tensor = flat.view(patch.shape)
+ 
+         weight_chunk.append((patch.name, checkpoint_tensor))
+         chunk_names.add(patch.name)
+         chunk_bytes += checkpoint_tensor_bytes
+ 
+     # Load the final partial chunk; the helper also accepts an empty chunk.
+-    loaded_names.update(_load_weight_chunk(model, weight_chunk, sparse=sparse))
++    with observe("receiver_load"):
++        loaded_names.update(_load_weight_chunk(model, weight_chunk, sparse=sparse))
+     return loaded_names
+diff --git a/tests/distributed/weight_transfer/test_profiling.py b/tests/distributed/weight_transfer/test_profiling.py
+new file mode 100644
+--- /dev/null
++++ b/tests/distributed/weight_transfer/test_profiling.py
+@@ -0,0 +1,54 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++import json
++from unittest.mock import MagicMock
++
++import pytest
++
++from vllm.distributed.weight_transfer import profiling
++
++
++def test_disabled_profile_does_not_synchronize(monkeypatch):
++    monkeypatch.delenv("VLLM_WEIGHT_TRANSFER_PROFILE", raising=False)
++    monkeypatch.setattr(
++        profiling.torch.accelerator,
++        "synchronize",
++        lambda: pytest.fail("disabled profile synchronized"),
++    )
++    profiler = profiling.WeightTransferProfiler(device="npu")
++    with profiler.measure("receive"):
++        pass
++    with profiler.measure_host("staging"):
++        pass
++    logger = MagicMock()
++    profiler.log(logger, role="test")
++    assert not profiler.seconds and not profiler.calls
++    logger.info.assert_not_called()
++
++
++def test_profile_records_exception_and_reports_units(monkeypatch):
++    monkeypatch.setenv("VLLM_WEIGHT_TRANSFER_PROFILE", "1")
++    ticks = iter([2.0, 5.0])
++    monkeypatch.setattr(profiling, "perf_counter", lambda: next(ticks))
++    profiler = profiling.WeightTransferProfiler(device="cpu")
++    with pytest.raises(RuntimeError), profiler.measure("receive"):
++        raise RuntimeError("load failed")
++    logger = MagicMock()
++    profiler.log(logger, role="test")
++    record = json.loads(logger.info.call_args.args[1])
++    assert record["seconds"] == {"receive": 3.0}
++    assert record["calls"] == {"receive": 1}
++
++
++def test_nested_host_observers_only_synchronize_outer_phase(monkeypatch):
++    monkeypatch.setenv("VLLM_WEIGHT_TRANSFER_PROFILE", "1")
++    ticks = iter([2.0, 3.0, 5.0, 7.0])
++    monkeypatch.setattr(profiling, "perf_counter", lambda: next(ticks))
++    profiler = profiling.WeightTransferProfiler(device="npu")
++    synchronize = MagicMock()
++    monkeypatch.setattr(profiler, "_synchronize", synchronize)
++    with profiler.measure("apply"), profiler.measure_host("staging"):
++        pass
++    assert synchronize.call_count == 2
++    assert dict(profiler.seconds) == {"staging_host_dispatch": 2.0, "apply": 5.0}
++    assert dict(profiler.calls) == {"staging_host_dispatch": 1, "apply": 1}
+diff --git a/tests/model_executor/model_loader/test_checkpoint_weight_patch.py b/tests/model_executor/model_loader/test_checkpoint_weight_patch.py
+--- a/tests/model_executor/model_loader/test_checkpoint_weight_patch.py
++++ b/tests/model_executor/model_loader/test_checkpoint_weight_patch.py
+@@ -1,5 +1,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++from contextlib import contextmanager
+ 
+ import pytest
+ import torch
+@@ -10,6 +12,42 @@
+ )
+ 
+ pytestmark = pytest.mark.cpu_test
++
++
++def test_phase_observer_preserves_dense_and_sparse_results():
++    phases = []
++
++    @contextmanager
++    def observe(name):
++        phases.append(name)
++        yield
++
++    model = _PackedTPModel()
++    load_checkpoint_weight_patches(
++        model,
++        [
++            CheckpointWeightPatch(
++                "q_proj.weight", (4,), torch.float32, torch.tensor([1.0, 2.0, 3.0, 4.0])
++            )
++        ],
++        phase_observer=observe,
++    )
++    assert torch.equal(model.packed_weight[:2], torch.tensor([3.0, 4.0]))
++    load_checkpoint_weight_patches(
++        model,
++        [
++            CheckpointWeightPatch(
++                "q_proj.weight",
++                (4,),
++                torch.float32,
++                torch.tensor([8.0]),
++                torch.tensor([3], dtype=torch.int32),
++            )
++        ],
++        phase_observer=observe,
++    )
++    assert torch.equal(model.packed_weight[:2], torch.tensor([3.0, 8.0]))
++    assert phases == ["receiver_validate", "receiver_staging", "receiver_load"] * 2
+ 
+ 
+ class _PackedTPModel(torch.nn.Module):
