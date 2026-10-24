@@ -34,6 +34,14 @@ class _FakeUpdater:
             "UpdateWeightFromDistributed",
             id="distributed",
         ),
+        pytest.param(
+            "full",
+            "sparse_hccl",
+            False,
+            "update_weight_from_distributed",
+            "UpdateWeightFromDistributed",
+            id="distributed-sparse-hccl",
+        ),
     ],
 )
 def test_create_weight_updater_selects_implementation(monkeypatch, mode, transport, colocate, module_name, class_name):
