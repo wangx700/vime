@@ -130,21 +130,20 @@ index bbbd85137c..809f1a66ea 100644
                      usage=final_usage_info,
                  )
 diff --git a/vllm/model_executor/model_loader/reload/meta.py b/vllm/model_executor/model_loader/reload/meta.py
-index a8f8023cf2..d62f39a2b8 100644
 --- a/vllm/model_executor/model_loader/reload/meta.py
 +++ b/vllm/model_executor/model_loader/reload/meta.py
-@@ -30,5 +30,6 @@ SKIP_LOAD_TENSORS: set[str] = {
+@@ -30,6 +30,7 @@ SKIP_LOAD_TENSORS: set[str] = {
      "expert_global_to_physical",
      "expert_physical_to_global",
      "expert_local_to_global",
 +    "expert_ids_per_ep_rank",
      "e_score_correction_bias",
  }
+ 
 diff --git a/vllm/model_executor/models/glm4_moe_lite_mtp.py b/vllm/model_executor/models/glm4_moe_lite_mtp.py
-index 1d30a0eaf6..37239f7f62 100644
 --- a/vllm/model_executor/models/glm4_moe_lite_mtp.py
 +++ b/vllm/model_executor/models/glm4_moe_lite_mtp.py
-@@ -129,6 +129,10 @@ class Glm4MoeLiteMultiTokenPredictorLayer(nn.Module):
+@@ -129,7 +129,11 @@ class Glm4MoeLiteMultiTokenPredictorLayer(nn.Module):
      ) -> torch.Tensor:
          assert inputs_embeds is not None
          # masking inputs at position 0, as not needed by MTP
@@ -156,7 +155,7 @@ index 1d30a0eaf6..37239f7f62 100644
 +        )
          inputs_embeds = self.enorm(inputs_embeds)
          previous_hidden_states = self.hnorm(previous_hidden_states)
-
+ 
 diff --git a/tests/model_executor/model_loader/test_local_checkpoint.py b/tests/model_executor/model_loader/test_local_checkpoint.py
 new file mode 100644
 index 0000000000..192b7e979a
@@ -309,7 +308,6 @@ index 0000000000..192b7e979a
 +    assert state == {"version": "000000"}
 diff --git a/vllm/utils/local_checkpoint.py b/vllm/utils/local_checkpoint.py
 new file mode 100644
-index 0000000000..42be58d249
 --- /dev/null
 +++ b/vllm/utils/local_checkpoint.py
 @@ -0,0 +1,319 @@
@@ -632,7 +630,6 @@ index 0000000000..42be58d249
 +            f"{version_dir}: {sorted(mismatches)[:20]}"
 +        )
 +    _write_applied_version(local_checkpoint_dir, version)
-+
 diff --git a/vllm/distributed/weight_transfer/profiling.py b/vllm/distributed/weight_transfer/profiling.py
 new file mode 100644
 --- /dev/null
@@ -714,7 +711,7 @@ new file mode 100644
 diff --git a/vllm/model_executor/model_loader/checkpoint_weight_patch.py b/vllm/model_executor/model_loader/checkpoint_weight_patch.py
 --- a/vllm/model_executor/model_loader/checkpoint_weight_patch.py
 +++ b/vllm/model_executor/model_loader/checkpoint_weight_patch.py
-@@ -13,6 +13,7 @@
+@@ -13,6 +13,7 @@ from __future__ import annotations
  
  import math
  from collections.abc import Iterable
@@ -722,24 +719,32 @@ diff --git a/vllm/model_executor/model_loader/checkpoint_weight_patch.py b/vllm/
  from typing import NamedTuple
  
  import torch
-@@ -142,6 +143,7 @@
+@@ -142,6 +143,9 @@ def load_checkpoint_weight_patches(
      *,
      max_chunk_bytes: int = _DEFAULT_PATCH_CHUNK_BYTES,
      validate_unique_indices: bool = True,
 +    phase_observer=None,
++    sparse_apply=None,
++    load_context=None,
  ) -> set[str]:
      """Load ordered patches through the model's checkpoint loader.
  
-@@ -173,6 +175,8 @@
+@@ -173,6 +177,14 @@ def load_checkpoint_weight_patches(
              each patch. Repeated patches may update the same positions. Disable
              only for a trusted producer that already guarantees unique positions
              within each patch.
++        sparse_apply: Optional extension called after validation for sparse
++            updates. Returns (remaining patches in original order, handled weight
++            names). It must preserve ordered replacement semantics and may mutate
++            model weights. Failure is nontransactional, as with native loading.
++        load_context: Optional context-manager factory entered only around native
++            model loading, after the sparse extension. Useful for loader views.
 +        phase_observer: Optional context-manager factory receiving a phase name
 +            for diagnostic timing. No device synchronization is added by default.
  
      Returns:
          Union of the weight names reported by all ``model.load_weights`` calls.
-@@ -181,6 +185,7 @@
+@@ -181,6 +193,7 @@ def load_checkpoint_weight_patches(
      if max_chunk_bytes <= 0:
          raise ValueError("max_chunk_bytes must be positive")
  
@@ -747,7 +752,7 @@ diff --git a/vllm/model_executor/model_loader/checkpoint_weight_patch.py b/vllm/
      patch_list = list(patches)
      patch_numels = [_validate_patch_structure(patch) for patch in patch_list]
      # All patches in one call must use the same dense or sparse representation.
-@@ -189,39 +194,44 @@
+@@ -189,41 +202,66 @@ def load_checkpoint_weight_patches(
          raise ValueError("Dense and sparse checkpoint patches cannot be mixed")
      sparse = sparse_flags == {True}
  
@@ -766,6 +771,10 @@ diff --git a/vllm/model_executor/model_loader/checkpoint_weight_patch.py b/vllm/
 -                # Sparse indices address the flattened full checkpoint tensor.
 -                patch_checks.append(
 -                    torch.logical_or(indices < 0, indices >= numel).any()
+-                )
+-                if validate_unique_indices:
+-                    # Equal neighboring indices after sorting indicate duplicates.
+-                    sorted_indices = torch.sort(indices).values
 +    with observe("receiver_validate"):
 +        # Keep validation results on their devices and read one combined result per
 +        # device, instead of synchronizing the CPU once for every patch.
@@ -780,9 +789,19 @@ diff --git a/vllm/model_executor/model_loader/checkpoint_weight_patch.py b/vllm/
 +                indices = patch.indices.to(device=patch.values.device)
 +                if indices.numel():
 +                    # Sparse indices address the flattened full checkpoint tensor.
-+                    patch_checks.append(
+                     patch_checks.append(
+-                        (sorted_indices[1:] == sorted_indices[:-1]).any()
 +                        torch.logical_or(indices < 0, indices >= numel).any()
-+                    )
+                     )
+-
+-            checks_by_device.setdefault(patch.values.device, []).extend(patch_checks)
+-
+-        for device_checks in checks_by_device.values():
+-            if torch.stack(device_checks).any().item():
+-                invalid_reasons = (
+-                    "NaN values, out-of-range indices, or duplicate indices"
+-                    if validate_unique_indices
+-                    else "NaN values or out-of-range indices"
 +                    if validate_unique_indices:
 +                        # Equal neighboring indices after sorting indicate duplicates.
 +                        sorted_indices = torch.sort(indices).values
@@ -793,22 +812,6 @@ diff --git a/vllm/model_executor/model_loader/checkpoint_weight_patch.py b/vllm/
 +                checks_by_device.setdefault(patch.values.device, []).extend(
 +                    patch_checks
                  )
--                if validate_unique_indices:
--                    # Equal neighboring indices after sorting indicate duplicates.
--                    sorted_indices = torch.sort(indices).values
--                    patch_checks.append(
--                        (sorted_indices[1:] == sorted_indices[:-1]).any()
--                    )
--
--            checks_by_device.setdefault(patch.values.device, []).extend(patch_checks)
--
--        for device_checks in checks_by_device.values():
--            if torch.stack(device_checks).any().item():
--                invalid_reasons = (
--                    "NaN values, out-of-range indices, or duplicate indices"
--                    if validate_unique_indices
--                    else "NaN values or out-of-range indices"
--                )
 -                raise ValueError(f"Sparse checkpoint patches contain {invalid_reasons}")
 +
 +            for device_checks in checks_by_device.values():
@@ -823,16 +826,36 @@ diff --git a/vllm/model_executor/model_loader/checkpoint_weight_patch.py b/vllm/
 +                    )
  
      loaded_names: set[str] = set()
++    if sparse and sparse_apply is not None:
++        # The extension sees fully validated patches before any loader views or
++        # full-shape staging. Unhandled patches retain their original order.
++        remaining, handled_names = sparse_apply(patch_list)
++        remaining = list(remaining)
++        cursor = iter(patch_list)
++        if any(
++            not any(candidate is patch for candidate in cursor) for patch in remaining
++        ):
++            raise ValueError("sparse_apply must return an ordered subset of its input")
++        loaded_names.update(handled_names)
++        patch_list = remaining
++        patch_numels = [math.prod(patch.shape) for patch in patch_list]
++
++    def load_chunk(weights):
++        if not weights:
++            return set()
++        with load_context() if load_context is not None else nullcontext():
++            return _load_weight_chunk(model, weights, sparse=sparse)
++
      # Collect checkpoint tensors for one model.load_weights() call.
-@@ -240,34 +250,39 @@
+     weight_chunk: list[tuple[str, torch.Tensor]] = []
+     chunk_names: set[str] = set()
+@@ -240,34 +278,37 @@ def load_checkpoint_weight_patches(
              chunk_bytes + checkpoint_tensor_bytes > max_chunk_bytes
              or patch.name in chunk_names
          ):
 -            loaded_names.update(_load_weight_chunk(model, weight_chunk, sparse=sparse))
 +            with observe("receiver_load"):
-+                loaded_names.update(
-+                    _load_weight_chunk(model, weight_chunk, sparse=sparse)
-+                )
++                loaded_names.update(load_chunk(weight_chunk))
              weight_chunk = []
              chunk_names = set()
              chunk_bytes = 0
@@ -881,7 +904,7 @@ diff --git a/vllm/model_executor/model_loader/checkpoint_weight_patch.py b/vllm/
      # Load the final partial chunk; the helper also accepts an empty chunk.
 -    loaded_names.update(_load_weight_chunk(model, weight_chunk, sparse=sparse))
 +    with observe("receiver_load"):
-+        loaded_names.update(_load_weight_chunk(model, weight_chunk, sparse=sparse))
++        loaded_names.update(load_chunk(weight_chunk))
      return loaded_names
 diff --git a/tests/distributed/weight_transfer/test_profiling.py b/tests/distributed/weight_transfer/test_profiling.py
 new file mode 100644
@@ -945,20 +968,19 @@ new file mode 100644
 diff --git a/tests/model_executor/model_loader/test_checkpoint_weight_patch.py b/tests/model_executor/model_loader/test_checkpoint_weight_patch.py
 --- a/tests/model_executor/model_loader/test_checkpoint_weight_patch.py
 +++ b/tests/model_executor/model_loader/test_checkpoint_weight_patch.py
-@@ -1,5 +1,7 @@
+@@ -1,6 +1,8 @@
  # SPDX-License-Identifier: Apache-2.0
  # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-+
-+from contextlib import contextmanager
  
++from contextlib import contextmanager
++
  import pytest
  import torch
-@@ -10,6 +12,42 @@
- )
  
+@@ -12,6 +14,42 @@ from vllm.model_executor.model_loader.checkpoint_weight_patch import (
  pytestmark = pytest.mark.cpu_test
-+
-+
+ 
+ 
 +def test_phase_observer_preserves_dense_and_sparse_results():
 +    phases = []
 +
@@ -993,6 +1015,93 @@ diff --git a/tests/model_executor/model_loader/test_checkpoint_weight_patch.py b
 +    )
 +    assert torch.equal(model.packed_weight[:2], torch.tensor([3.0, 8.0]))
 +    assert phases == ["receiver_validate", "receiver_staging", "receiver_load"] * 2
- 
- 
++
++
  class _PackedTPModel(torch.nn.Module):
+     """Model that packs the TP rank 1 shards of Q and K into one parameter."""
+ 
+@@ -108,3 +146,84 @@ def test_dense_and_sparse_patches_follow_packed_tp_loader():
+     )
+     assert no_local_weight_loaded == set()
+     assert torch.equal(no_local_weight_model.weight, torch.tensor([1.0]))
++
++
++def test_sparse_extension_is_validated_before_writes_and_outside_loader_context():
++    from contextlib import contextmanager
++
++    model = _PackedTPModel()
++    events = []
++
++    @contextmanager
++    def loader_context():
++        events.append("enter")
++        yield
++        events.append("exit")
++
++    def apply(patches):
++        assert not events
++        events.append("direct")
++        model.packed_weight.data[0] = 99
++        return patches[1:], {patches[0].name}
++
++    patches = [
++        _make_patch("q_proj.weight", indices=[2], values=[99.0]),
++        _make_patch("k_proj.weight", indices=[2], values=[20.0]),
++    ]
++    loaded = load_checkpoint_weight_patches(
++        model, patches, sparse_apply=apply, load_context=loader_context
++    )
++    assert loaded == {"q_proj.weight", "k_proj.weight"}
++    assert model.packed_weight[0] == 99 and model.packed_weight[2] == 20
++    assert events == ["direct", "enter", "exit"]
++
++    events.clear()
++    patches.append(_make_patch("bad", indices=[4], values=[1.0]))
++    with pytest.raises(ValueError):
++        load_checkpoint_weight_patches(
++            model, patches, sparse_apply=apply, load_context=loader_context
++        )
++    assert events == []
++
++
++def test_dense_updates_bypass_sparse_extension_and_restore_loader_context_on_error():
++    from contextlib import contextmanager
++
++    events = []
++
++    @contextmanager
++    def loader_context():
++        events.append("enter")
++        try:
++            yield
++        finally:
++            events.append("exit")
++
++    class FailedLoader:
++        def load_weights(self, weights):
++            raise RuntimeError("loader failed")
++
++    def never_apply(_patches):
++        pytest.fail("dense bootstrap must not invoke sparse extension")
++
++    with pytest.raises(RuntimeError, match="loader failed"):
++        load_checkpoint_weight_patches(
++            FailedLoader(),
++            [_make_patch("weight", values=[1.0, 2.0, 3.0, 4.0])],
++            sparse_apply=never_apply,
++            load_context=loader_context,
++        )
++    assert events == ["enter", "exit"]
++
++
++def test_sparse_extension_rejects_reordered_fallback():
++    patches = [
++        _make_patch("q_proj.weight", indices=[2], values=[1.0]),
++        _make_patch("k_proj.weight", indices=[2], values=[2.0]),
++    ]
++    with pytest.raises(ValueError, match="ordered subset"):
++        load_checkpoint_weight_patches(
++            _PackedTPModel(),
++            patches,
++            sparse_apply=lambda rows: (list(reversed(rows)), set()),
++        )

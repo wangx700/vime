@@ -142,13 +142,16 @@ def get_vime_extra_args_provider(add_custom_arguments=None):
             )
             parser.add_argument(
                 "--update-weight-transport",
-                choices=["nccl", "disk"],
+                choices=["nccl", "disk", "sparse_hccl"],
                 default="nccl",
                 help=(
-                    "Carrier for weight sync. In full mode, 'nccl' broadcasts chunks and "
-                    "'disk' writes a complete HF checkpoint under --update-weight-disk-dir "
-                    "before engines reload it. Delta mode is 'disk' only: each host applies the "
-                    "published deltas into its local checkpoint and reloads via update_weights_from_disk."
+                    "Carrier for weight sync. In full mode, 'nccl' broadcasts chunks; "
+                    "'sparse_hccl' broadcasts only the elements that changed since the previous "
+                    "sync (Ascend: trainer-side SparseHCCLTrainerWeightTransferEngine, inference "
+                    "side SparseHCCLWeightTransferEngine); 'disk' writes a complete HF checkpoint "
+                    "under --update-weight-disk-dir before engines reload it. Delta mode is 'disk' "
+                    "only: each host applies the published deltas into its local checkpoint and "
+                    "reloads via update_weights_from_disk."
                 ),
             )
             parser.add_argument(

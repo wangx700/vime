@@ -38,8 +38,9 @@ def create_weight_updater(
         update_weight_cls = UpdateWeightFromTensor
     else:
         assert update_weight_mode == "full"
-        assert (
-            update_weight_transport == "nccl"
+        assert update_weight_transport in (
+            "nccl",
+            "sparse_hccl",
         ), f"unsupported weight sync mode/transport: {update_weight_mode!r}/{update_weight_transport!r}"
         from .update_weight_from_distributed import UpdateWeightFromDistributed
 
