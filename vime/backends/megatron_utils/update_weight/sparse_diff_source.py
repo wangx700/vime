@@ -52,13 +52,12 @@ def _sparse_weight_patch() -> Any:
 class SparseDiffSource:
     """Turn consecutive full HF exports into one round's sparse patches.
 
-    Only the trainer sender rank diffs; every other rank consumes the export
-    without building patches because it never sends.
+    Only the trainer sender rank (rank 0) diffs; every other rank must not keep
+    a host snapshot, because a full export is tens of GB per trainer process.
     """
 
-    def __init__(self, source: Any, *, snapshot_in_host: bool = True) -> None:
+    def __init__(self, source: Any) -> None:
         self._source = source
-        self._snapshot_in_host = snapshot_in_host
         self._previous: dict[str, torch.Tensor] = {}
         self.stats: dict[str, float] = {}
         self.patches: list[Any] = []
@@ -84,8 +83,6 @@ class SparseDiffSource:
         started = time.perf_counter()
 
         for name, tensor in self._source:
-            if not self._snapshot_in_host:
-                continue
             step = time.perf_counter()
             current = tensor.detach().to("cpu", copy=True).contiguous()
             exported += current.numel()
@@ -144,6 +141,10 @@ class SparseTrainerAdapter:
         self.engine = engine
 
     def send_weights(self) -> None:
+        if not self.engine.is_sender:
+            # Sparse transfers are sender-only: a non-sender rank neither diffs
+            # nor collects, so it never pays the host snapshot cost.
+            return
         self.engine.send_weights(self.source.collect())
 
     def pop_metrics(self) -> dict[str, float]:
