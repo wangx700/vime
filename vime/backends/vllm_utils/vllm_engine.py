@@ -699,6 +699,10 @@ def _compute_server_args(
     kwargs["weight_transfer_config"]["backend"] = current_platform().weight_transfer.backend(
         kwargs["weight_transfer_config"]["backend"]
     )
+    if getattr(args, "update_weight_transport", "nccl") == "sparse_hccl":
+        # Ascend registers the sparse HCCL pair under this backend name; the
+        # inference side is SparseHCCLWeightTransferEngine.
+        kwargs["weight_transfer_config"] = {"backend": "sparse_hccl"}
 
     if worker_type == "encoder":
         # vLLM EPD producers have no language-model KV cache groups. Prefix

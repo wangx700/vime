@@ -67,11 +67,16 @@ class UpdateWeightFromDistributed:
             lambda: self.weight_version,
             engine_gpu_counts,
         )
-        self._trainer = create_nccl_trainer(
-            client,
-            self._source,
-            engine_gpu_counts,
-        )
+        if getattr(self.args, "update_weight_transport", "nccl") == "sparse_hccl":
+            from .sparse_diff_source import create_sparse_trainer
+
+            self._trainer = create_sparse_trainer(client, self._source, engine_gpu_counts)
+        else:
+            self._trainer = create_nccl_trainer(
+                client,
+                self._source,
+                engine_gpu_counts,
+            )
 
     def disconnect_rollout_engines(self) -> None:
         if self._trainer is not None:
