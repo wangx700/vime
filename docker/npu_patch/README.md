@@ -56,6 +56,22 @@ git -C /vllm-workspace/vllm-ascend apply --check "${PATCH_DIR}/vllm-ascend.patch
 git -C /vllm-workspace/vllm-ascend apply "${PATCH_DIR}/vllm-ascend.patch"
 ```
 
+`vllm-ascend.patch` carries the Ascend sparse weight-transfer backend from
+vllm-ascend `#18915`: `SparseHCCLTrainerWeightTransferEngine` is the trainer-side
+sender and `SparseHCCLWeightTransferEngine` the inference-side receiver, both
+registered under the `sparse_hccl` backend name. With these patches applied and
+`vime` installed, weights can be synced without a shared filesystem:
+
+```bash
+--update-weight-mode delta --update-weight-transport sparse_hccl
+```
+
+The first sync bootstraps complete values over dense HCCL; later syncs send only
+changed indices and values on the same communication group. It requires
+non-colocated, unquantized rollout weights, and TP/PP/EP > 1 needs the matching
+sparse receiver. See `docs/en/advanced/delta-weight-sync.md` for the knobs and
+the trade-offs against the `disk` transport.
+
 ### 2. Megatron-LM
 
 Apply the common Megatron patch before the NPU patch.
