@@ -1,4 +1,4 @@
-"""Train TP2/PP2/EP2; native #18915 rollout TP4/PP1/EP4."""
+"""Train TP2/PP2/EP2; native #18915 rollout TP2/PP1/EP2 (six NPUs)."""
 
 import os
 import shlex
@@ -78,12 +78,13 @@ def execute():
     )
 
     vllm_args = (
-        "--rollout-num-gpus-per-engine 4 "
+        "--rollout-num-gpus-per-engine 2 "
         "--vllm-pipeline-parallel-size 1 "
         "--vllm-enable-expert-parallel "
         "--vllm-expert-placement-strategy linear "
         "--vllm-gpu-memory-utilization 0.6 "
         "--vllm-enforce-eager "
+        "--vllm-enable-scale-out "
         "--vllm-additional-config '{\"weight_nz_mode\":0}' "
     )
 
@@ -109,7 +110,7 @@ def execute():
         "--train-backend megatron "
         "--actor-num-nodes 1 "
         "--actor-num-gpus-per-node 4 "
-        "--rollout-num-gpus 4 "
+        "--rollout-num-gpus 2 "
         "--ci-test "
     )
 
