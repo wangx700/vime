@@ -169,12 +169,19 @@ def _run_sparse_full_comparison(rank, cfg_dir):
 
     from megatron.bridge import AutoBridge
 
+    from vime.backends.megatron_utils.update_weight.hf_weight_iterator_sparse_bridge import (
+        configure_bridge_module_types,
+    )
+
+    configure_bridge_module_types()
     bridge = AutoBridge.from_hf_pretrained(cfg_dir, trust_remote_code=True)
     config = bridge.hf_pretrained.config
     rope = getattr(config, "rope_parameters", None) or {}
     if "rope_theta" in rope and not hasattr(config, "rope_theta"):
         config.rope_theta = rope["rope_theta"]
     provider = bridge.to_megatron_provider(load_weights=False)
+    # Older Bridge providers otherwise use their default instead of HF head_dim.
+    provider.kv_channels = bridge.hf_pretrained.config.head_dim
     provider.tensor_model_parallel_size = TP
     provider.pipeline_model_parallel_size = PP
     provider.expert_model_parallel_size = EP

@@ -11,10 +11,25 @@ from megatron.core.utils import unwrap_model
 from .megatron_delta_export import trim_hf_vocab_padding
 
 
+def configure_bridge_module_types():
+    """Teach older Bridge releases about Megatron's column-parallel CE head."""
+    from megatron.bridge.models.conversion.param_mapping import AutoMapping
+    from megatron.core.tensor_parallel import ColumnParallelLinear
+
+    try:
+        from megatron.core.transformer.linear_cross_entropy import LinearCrossEntropyModule
+    except ImportError:
+        return
+    if not issubclass(LinearCrossEntropyModule, ColumnParallelLinear):
+        raise TypeError("Bridge CE-head registration requires ColumnParallelLinear inheritance")
+    AutoMapping.register_module_type(LinearCrossEntropyModule.__name__, "column")
+
+
 class HfWeightIteratorSparseBridge:
     def __init__(self, args, model):
         from megatron.bridge import AutoBridge
 
+        configure_bridge_module_types()
         self.args = args
         self.model = model
         self.bridge = AutoBridge.from_hf_pretrained(args.hf_checkpoint, trust_remote_code=True)
