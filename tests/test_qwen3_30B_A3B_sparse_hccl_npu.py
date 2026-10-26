@@ -1,4 +1,4 @@
-"""Non-colocated Qwen3-MoE sparse synchronization with TP2/PP2/EP2."""
+"""Train TP2/PP2/EP2; native #18915 rollout TP4/PP1/EP4."""
 
 import os
 import shlex
@@ -79,7 +79,7 @@ def execute():
 
     vllm_args = (
         "--rollout-num-gpus-per-engine 4 "
-        "--vllm-pipeline-parallel-size 2 "
+        "--vllm-pipeline-parallel-size 1 "
         "--vllm-enable-expert-parallel "
         "--vllm-expert-placement-strategy linear "
         "--vllm-gpu-memory-utilization 0.6 "

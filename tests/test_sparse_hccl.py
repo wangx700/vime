@@ -119,30 +119,6 @@ def _compare_sparse_with_full_weights(model, cfg_dir, rank):
         return {name: weight.detach().cpu().clone() for chunk in iterator.get_hf_weight_chunks() for name, weight in chunk}
 
     accumulated = export()
-    # Reuse both real exporters on the same live shards before any mutation.
-    # The fixed tiny checkpoint above has these exact model dimensions.
-    from vime.backends.megatron_utils.update_weight.common import named_params_and_buffers
-    from vime.backends.megatron_utils.update_weight.hf_weight_iterator_direct import HfWeightIteratorDirect
-
-    direct_args = SimpleNamespace(
-        update_weight_buffer_size=4096, num_experts=4, vocab_size=512,
-        hidden_size=64, num_attention_heads=4, num_query_groups=2, kv_channels=16,
-    )
-    direct = HfWeightIteratorDirect(direct_args, model, "qwen3moe", None)
-    local_weights = dict(named_params_and_buffers(direct_args, model))
-    direct_weights = {}
-    for chunk in direct.get_hf_weight_chunks(local_weights):
-        for name, weight in chunk:
-            assert name not in direct_weights, f"Duplicate Direct export: {name}"
-            direct_weights[name] = weight.detach().cpu().contiguous().clone()
-    assert direct_weights.keys() == accumulated.keys()
-    for name, expected_weight in accumulated.items():
-        actual_weight = direct_weights[name]
-        assert actual_weight.dtype == expected_weight.dtype and actual_weight.shape == expected_weight.shape, name
-        assert torch.equal(actual_weight.view(torch.uint8), expected_weight.contiguous().view(torch.uint8)), name
-    if rank == 0:
-        print(f"DIRECT VS BRIDGE PASS: tensors={len(direct_weights)} bitwise_equal=True", flush=True)
-    del direct_weights, direct, local_weights
     snapshots = {}
     prime_delta_snapshots(index, snapshots, pin=False)
     torch.npu.synchronize()
@@ -319,6 +295,37 @@ def distributed_rendezvous(tmp_path):
     store = dist.TCPStore("127.0.0.1", 0, is_master=True, wait_for_workers=False, timeout=timedelta(seconds=120))
     yield store.port, str(tmp_path / "qwen3_moe")
     del store
+
+
+@pytest.mark.parametrize("batch_size", [1, 32])
+def test_nonempty_delta_always_uses_bridge_converter(monkeypatch, batch_size):
+    """A cached standard mapping must still execute its Bridge converter."""
+    from megatron.bridge.models.conversion.param_mapping import ReplicatedMapping
+
+    local = torch.tensor([[11.0, 0.0], [0.0, 13.0]])
+    mapping = ReplicatedMapping("weight", "weight")
+    calls = []
+
+    def convert(probe, module):
+        calls.append(probe.clone())
+        return {"weight": probe * 2}
+
+    monkeypatch.setattr(mapping, "megatron_to_hf", convert)
+    monkeypatch.setattr(megatron_delta_export, "_device_shard", lambda record: local.view(-1))
+    record = SimpleNamespace(
+        param=local, probe=mapping, module=None, megatron_name="weight",
+        slots=[("weight", (2, 2))], hf_vocab_size=None,
+        spec=SimpleNamespace(contributes=True, gather_group=None),
+    )
+    entries = list(megatron_delta_export.iter_delta_entries(
+        [record], {"weight": torch.zeros_like(local).view(-1)}, batch_size=batch_size,
+    ))
+    assert len(calls) == len(entries) == 1
+    assert torch.isnan(calls[0].reshape(-1)[[1, 2]]).all()
+    _slots, _dtype, counts, indices, values, _group = entries[0]
+    assert counts.tolist() == [2]
+    assert indices.tolist() == [0, 3]
+    assert values.tolist() == [22.0, 26.0]
 
 
 def test_snapshot_is_independent_and_requires_live_weights(monkeypatch):
@@ -523,48 +530,51 @@ def test_native_bucket_preserves_checkpoint_coordinates_when_split():
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize("capacity,expected_flushes", [(16, 2), (64, 1)])
-def test_native_dense_seed_reuses_complete_checkpoint_chunks(monkeypatch, capacity, expected_flushes):
+@pytest.mark.parametrize("capacity,expected_flushes", [(16, 4), (64, 1)])
+def test_native_seed_uses_public_sparse_chunks(monkeypatch, capacity, expected_flushes):
     instance = updater_module.UpdateWeightFromSparseHCCL.__new__(updater_module.UpdateWeightFromSparseHCCL)
     expected = {"weight": torch.arange(6, dtype=torch.float32).reshape(2, 3), "bias": torch.tensor([3.0, 5.0])}
     instance.args = SimpleNamespace(update_weight_buffer_size=capacity)
     chunks = [[item] for item in expected.items()] if capacity == 16 else [list(expected.items())]
-    instance._seed_iterator = SimpleNamespace(get_hf_weight_chunks=lambda *a, **kw: iter(chunks))
-    instance._iterator = SimpleNamespace(get_hf_weight_chunks=lambda *a, **kw: pytest.fail("seed must reuse the full exporter"))
+    instance._iterator = SimpleNamespace(get_hf_weight_chunks=lambda *a, **kw: iter(chunks))
     instance.weights_getter = lambda: {}
+    instance._client = object()
     sent = []
-    instance._trainer = SimpleNamespace(send_dense_weight_chunk=lambda weights: sent.append(list(weights)))
+    from contextlib import nullcontext
+
+    instance._trainer = SimpleNamespace(
+        model_update_group=SimpleNamespace(device=torch.device("cpu")),
+        send_weight_chunk=lambda patches: sent.append(list(patches)),
+    )
+    instance._profile = SimpleNamespace(measure=lambda *a: nullcontext())
     instance._payload_started = False
     monkeypatch.setattr(updater_module.dist, "get_rank", lambda: 0)
-    monkeypatch.setattr(updater_module.torch, "arange", lambda *a, **kw: pytest.fail("dense seed must not allocate indices"))
-    flushes, wire = instance._send_dense()
-    actual = dict(item for chunk in sent for item in chunk)
-    assert flushes == len(sent) == expected_flushes and wire == 8 * 4
+    flushes, wire = instance._send_seed()
+    actual = {name: torch.zeros_like(tensor).flatten() for name, tensor in expected.items()}
+    for chunk in sent:
+        for patch in chunk:
+            assert patch.full_shape == tuple(expected[patch.name].shape)
+            actual[patch.name].index_copy_(0, patch.indices.long(), patch.values)
+    assert flushes == len(sent) == expected_flushes and wire == 8 * (4 + 4)
     assert instance._payload_started
-    assert all(torch.equal(actual[name], tensor) for name, tensor in expected.items())
+    assert all(torch.equal(actual[name], tensor.flatten()) for name, tensor in expected.items())
 
 
 @pytest.mark.unit
-def test_dense_seed_initializes_full_exporter_on_non_wire_rank(monkeypatch):
+def test_native_seed_uses_bridge_on_non_wire_rank(monkeypatch):
     instance = updater_module.UpdateWeightFromSparseHCCL.__new__(updater_module.UpdateWeightFromSparseHCCL)
-    instance.args = SimpleNamespace()
-    instance.model = []
-    instance.model_name = "qwen3"
-    instance.quantization_config = None
-    instance._seed_iterator = None
-    weights = {}
-    instance.weights_getter = lambda: weights
+    instance.args = SimpleNamespace(update_weight_buffer_size=1024)
     calls = []
 
-    def create(**kwargs):
+    def export(**kwargs):
         calls.append(kwargs)
-        return SimpleNamespace(get_hf_weight_chunks=lambda received, **kw: iter([]) if received is weights else pytest.fail("wrong weight source"))
+        return iter([])
 
-    monkeypatch.setattr(updater_module, "HfWeightIteratorDirect", create)
+    instance._iterator = SimpleNamespace(get_hf_weight_chunks=export)
     monkeypatch.setattr(updater_module.dist, "get_rank", lambda: 1)
-    assert instance._send_dense() == (0, 0)
-    assert instance._send_dense() == (0, 0)
-    assert calls == [dict(args=instance.args, model=instance.model, model_name="qwen3", quantization_config=None)]
+    assert instance._send_seed() == (0, 0)
+    assert instance._send_seed() == (0, 0)
+    assert calls == [{"progress_desc": "Native sparse HCCL Bridge seed"}] * 2
 
 
 @pytest.mark.unit
@@ -574,10 +584,72 @@ def test_native_receiver_verification_request_is_rejected():
 
 
 @pytest.mark.unit
-def test_native_sparse_updates_do_not_replay_dense_seed(updater):
+@pytest.mark.parametrize("indices,values", [([-1], [1.0]), ([4], [1.0]), ([1, 1], [1.0, 2.0]), ([0], [float("nan")])])
+def test_native_payload_rejected_before_engine_send(monkeypatch, indices, values):
+    from contextlib import nullcontext
+
+    instance = updater_module.UpdateWeightFromSparseHCCL.__new__(updater_module.UpdateWeightFromSparseHCCL)
+    instance._client = object()
+    instance._payload_started = False
+    instance._profile = SimpleNamespace(measure=lambda *a: nullcontext())
+    instance._trainer = SimpleNamespace(
+        model_update_group=SimpleNamespace(device=torch.device("cpu")),
+        send_weight_chunk=lambda patches: pytest.fail("invalid payload reached native engine"),
+    )
+    monkeypatch.setattr(updater_module.dist, "get_rank", lambda: 0)
+    patch = updater_module.SparseWeightPatch("weight", torch.tensor(indices, dtype=torch.int32), torch.tensor(values), (4,))
+    with pytest.raises(ValueError, match="Sparse payload"):
+        instance._publish_flush([patch])
+    assert not instance._payload_started
+
+
+@pytest.mark.unit
+def test_native_payload_normalizes_noncontiguous_tensors_once_per_chunk(monkeypatch):
+    patches = [updater_module.SparseWeightPatch(
+        name, torch.tensor([0, 99, 3, 99], dtype=torch.int32)[::2], torch.tensor([0.0, 99.0, 7.0, 99.0])[::2], (4,)
+    ) for name in ("first", "second")]
+    original = torch.Tensor.item
+    reads = []
+
+    def read(tensor):
+        reads.append(True)
+        return original(tensor)
+
+    monkeypatch.setattr(torch.Tensor, "item", read)
+    prepared = updater_module.prepare_native_sparse_patches(patches, torch.device("cpu"))
+    assert len(reads) == 1
+    assert all(p.indices.is_contiguous() and p.values.is_contiguous() for p in prepared)
+    assert all(p.values.tolist() == [0.0, 7.0] for p in prepared)
+
+
+@pytest.mark.unit
+def test_native_loader_large_shape_limit_is_explicit():
+    patch = updater_module.SparseWeightPatch("large", torch.tensor([0], dtype=torch.int32), torch.tensor([1.0]), (2**31,))
+    with pytest.raises(ValueError, match="smaller than 2\\*\\*31"):
+        updater_module.prepare_native_sparse_patches([patch], torch.device("cpu"))
+
+
+@pytest.mark.unit
+def test_native_receiver_pp_rejected_before_bridge_initialization():
+    args = SimpleNamespace(update_weight_delta_verify_every=0, colocate=False, vllm_pipeline_parallel_size=2)
+    with pytest.raises(ValueError, match="pipeline_parallel_size=1"):
+        updater_module.UpdateWeightFromSparseHCCL(args, [], lambda: {}, model_name="test", quantization_config=None)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("config", [{"pp_size": 2}, {"pipeline_parallel_size": 2}, {"pcp_size": 2}, {"prefill_context_parallel_size": 2}])
+def test_native_external_parallel_config_rejected_before_rendezvous(config):
+    instance = updater_module.UpdateWeightFromSparseHCCL.__new__(updater_module.UpdateWeightFromSparseHCCL)
+    instance.disconnect_rollout_engines = lambda: pytest.fail("unsupported config reached connection setup")
+    with pytest.raises(ValueError, match="does not support"):
+        instance.connect_rollout_engines([], None, engine_parallel_configs=[config])
+
+
+@pytest.mark.unit
+def test_native_sparse_updates_do_not_replay_seed(updater):
     finishes = []
     updater._send_sparse_delta = lambda: (1, 24, 4)
-    updater._send_dense = lambda: pytest.fail("steady updates must not replay seed")
+    updater._send_seed = lambda: pytest.fail("steady updates must not replay seed")
     updater._finish_update = lambda: finishes.append(updater.weight_version)
     for _ in range(3):
         updater.update_weights()
@@ -603,7 +675,7 @@ def test_nan_guard_precedes_payload_and_snapshots(updater, monkeypatch, local_na
     recovered = []
     updater._recover_before_payload = lambda: recovered.append(True)
     if local_nan or remote_nan:
-        updater._send_dense = lambda **kwargs: pytest.fail("NaN seed must not be sent")
+        updater._send_seed = lambda **kwargs: pytest.fail("NaN seed must not be sent")
         updater._send_sparse_delta = lambda **kwargs: pytest.fail("NaN delta must not be sent")
         monkeypatch.setattr(updater_module, "prime_delta_snapshots", lambda *a, **kw: pytest.fail("snapshot changed"))
         with pytest.raises(ValueError, match="NaN weights"):

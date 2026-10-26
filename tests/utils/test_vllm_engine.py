@@ -23,6 +23,30 @@ from vime.backends.vllm_utils import vllm_engine as mod
 NUM_GPUS = 0
 
 
+@pytest.mark.unit
+@pytest.mark.parametrize("physical", [True, False])
+def test_npu_discrete_visible_devices_follow_placement_group_order(monkeypatch, physical):
+    monkeypatch.setattr(mod, "current_platform", lambda: SimpleNamespace(is_npu=True))
+    monkeypatch.setenv("ASCEND_RT_VISIBLE_DEVICES", "15,2,10,8,7,6,14,5")
+    assert mod._engine_visible_devices(8 if physical else 4, 4, base_is_physical=physical) == "8,10,14,15"
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("base,count", [(9, 1), (14, 3)])
+def test_npu_visibility_rejects_unassigned_or_incomplete_range(monkeypatch, base, count):
+    monkeypatch.setattr(mod, "current_platform", lambda: SimpleNamespace(is_npu=True))
+    monkeypatch.setenv("ASCEND_RT_VISIBLE_DEVICES", "2,5,6,7,8,10,14,15")
+    with pytest.raises(ValueError):
+        mod._engine_visible_devices(base, count, base_is_physical=True)
+
+
+@pytest.mark.unit
+def test_cuda_visibility_retains_existing_contiguous_behavior(monkeypatch):
+    monkeypatch.setattr(mod, "current_platform", lambda: SimpleNamespace(is_npu=False))
+    monkeypatch.setenv("ASCEND_RT_VISIBLE_DEVICES", "2,5,6,7")
+    assert mod._engine_visible_devices(4, 4, base_is_physical=True) == "4,5,6,7"
+
+
 @pytest.fixture(autouse=True)
 def _patch_vllm_server_fields(monkeypatch):
     """Stub _VLLM_SERVER_FIELDS so tests don't need a real vllm install."""

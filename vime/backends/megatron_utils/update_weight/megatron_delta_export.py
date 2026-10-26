@@ -389,102 +389,12 @@ def _exchange_slot_tables(index: list[McoreParamExport], slot_cache: dict) -> No
         rec.slots = [(n, tuple(shape)) for (n, shape) in union.keys()] if union else None
 
 
-def _direct_hf_delta_entry(rec, lidx, lval, *, sorted_indices=False, midpoint=None):
-    """Sparse equivalents of exact Bridge mappings; unknown transforms use the probe.
-
-    Use Bridge's resolved names and TP/ETP properties, never model-name guesses.
-    Subclasses may implement arithmetic transforms and deliberately do not match.
-    """
-    from megatron.bridge.models.conversion.param_mapping import (
-        AutoMapping,
-        ColumnParallelMapping,
-        GatedMLPMapping,
-        ReplicatedMapping,
-        RowParallelMapping,
-    )
-
-    mapping = rec.probe
-    if type(mapping) is AutoMapping:
-        if mapping.permute_dims is not None:
-            return None
-        mapping = mapping._mapping
-    if type(mapping) not in (ColumnParallelMapping, RowParallelMapping, ReplicatedMapping, GatedMLPMapping):
-        return None
-    if type(rec.param) not in (torch.Tensor, torch.nn.Parameter) or rec.param.ndim not in (1, 2):
-        return None
-    shape = tuple(rec.param.shape)
-    size, rank = mapping.tp_size, mapping.tp_rank
-    pieces = {}
-    if type(mapping) is GatedMLPMapping:
-        if shape[0] % 2:
-            return None
-        half = rec.param.numel() // 2
-        out_shape = (shape[0] // 2 * size, *shape[1:])
-        if sorted_indices:
-            # nonzero emits ascending shard positions. One scalar read replaces
-            # four dynamic boolean selections; generic callers retain fallback.
-            split = int(torch.searchsorted(lidx, half)) if midpoint is None else midpoint
-        for part, key in enumerate(("gate", "up")):
-            selected = (
-                (slice(0, split) if part == 0 else slice(split, None))
-                if sorted_indices
-                else ((lidx >= part * half) & (lidx < (part + 1) * half))
-            )
-            pieces[str(mapping.hf_param[key])] = (
-                out_shape,
-                lidx[selected] - part * half + rank * half,
-                lval[selected],
-            )
-    else:
-        out_shape = list(shape)
-        indices = lidx
-        if type(mapping) is ColumnParallelMapping:
-            out_shape[0] *= size
-            indices = lidx + rank * rec.param.numel()
-        elif type(mapping) is RowParallelMapping and len(shape) == 2:
-            out_shape[1] *= size
-            indices = (lidx // shape[1]) * out_shape[1] + lidx % shape[1] + rank * shape[1]
-        pieces[str(mapping.hf_param)] = (tuple(out_shape), indices, lval)
-    slot_shapes = dict(rec.slots)
-    for name, (shape, _, _) in pieces.items():
-        if name not in slot_shapes:
-            return None
-        expected = tuple(slot_shapes[name])
-        vocab_trim = rec.hf_vocab_size is not None and (
-            name.endswith("embed_tokens.weight") or name.endswith("lm_head.weight")
-        )
-        if shape != expected and not (
-            vocab_trim and expected == (rec.hf_vocab_size, *shape[1:]) and shape[0] >= expected[0]
-        ):
-            return None
-    counts = torch.zeros(len(rec.slots), dtype=torch.int64)
-    index_parts, value_parts = [], []
-    for slot, (name, shape) in enumerate(rec.slots):
-        if name not in pieces:
-            continue
-        _, indices, values = pieces[name]
-        if tuple(shape) != pieces[name][0]:
-            limit = 1
-            for dim in shape:
-                limit *= dim
-            selected = indices < limit
-            indices, values = indices[selected], values[selected]
-        counts[slot] = indices.numel()
-        index_parts.append(indices.to(torch.int32))
-        value_parts.append(values)
-    return (rec.slots, str(lval.dtype).replace("torch.", ""), counts, torch.cat(index_parts), torch.cat(value_parts))
-
-
 def mcore_hf_delta_entry(
     rec: McoreParamExport,
     _place,
     lidx: torch.Tensor,
     lval: torch.Tensor,
     slot_cache: dict,
-    *,
-    force_probe=False,
-    sorted_indices=False,
-    midpoint=None,
 ):
     """Probe one mcore param's shard-local delta into its final HF-coordinate
     entry ``(slots, dtype_str, counts, hf_idx, hf_val)``.
@@ -519,11 +429,6 @@ def mcore_hf_delta_entry(
             torch.empty(0, dtype=torch.int32, device=lval.device),
             torch.empty(0, dtype=lval.dtype, device=lval.device),
         )
-
-    if not force_probe and rec.slots is not None:
-        direct = _direct_hf_delta_entry(rec, lidx, lval, sorted_indices=sorted_indices, midpoint=midpoint)
-        if direct is not None:
-            return direct
 
     buf = torch.full(tuple(rec.param.shape), float("nan"), dtype=lval.dtype, device=lval.device)
     if lidx.numel():
@@ -689,7 +594,7 @@ def _iter_delta_entries_unbatched(index, snapshots):
                 local_indices = torch.empty(0, dtype=torch.int64, device=local.device)
                 local_values = torch.empty(0, dtype=local.dtype, device=local.device)
         yield (
-            *mcore_hf_delta_entry(record, 0, local_indices, local_values, {}, sorted_indices=True),
+            *mcore_hf_delta_entry(record, 0, local_indices, local_values, {}),
             record.spec.gather_group,
         )
     refresh.flush()
@@ -710,11 +615,10 @@ def iter_delta_entries(index, snapshots, *, batch_size=32):
     batch_key = None
 
     def flush():
-        deltas = iter(compact_shard_masks(locals_, masks, with_midpoints=True))
+        deltas = iter(compact_shard_masks(locals_, masks))
         for record, local, snapshot in pending:
-            midpoint = None
             if snapshot is not None:
-                indices, values, midpoint = next(deltas)
+                indices, values = next(deltas)
                 if snapshot.device == local.device:
                     snapshot.copy_(local, non_blocking=True)
                 elif indices.numel():
@@ -725,7 +629,7 @@ def iter_delta_entries(index, snapshots, *, batch_size=32):
                 indices = torch.empty(0, dtype=torch.int64, device=device)
                 values = torch.empty(0, dtype=dtype, device=device)
             yield (
-                *mcore_hf_delta_entry(record, 0, indices, values, {}, sorted_indices=True, midpoint=midpoint),
+                *mcore_hf_delta_entry(record, 0, indices, values, {}),
                 record.spec.gather_group,
             )
         pending.clear()

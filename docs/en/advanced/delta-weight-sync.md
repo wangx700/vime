@@ -7,8 +7,9 @@ every sync is the dominant cost.
 
 Two transports are available: `disk` for shared-storage and cross-cluster deployments, and
 `sparse_hccl` for online transfer between Ascend trainers and vLLM-Ascend rollout workers.
-Sparse HCCL bootstraps with complete values over dense HCCL, then sends only
-changed indices and values on later syncs using the same communication group.
+Sparse HCCL uses the two native engines from vLLM-Ascend #18915. The first sync
+sends every checkpoint coordinate through the public sparse protocol; later syncs
+send only changed coordinates. Both seed and deltas are exported through Megatron-Bridge.
 
 ## Configuration
 
@@ -21,24 +22,17 @@ Sparse HCCL:
 --update-weight-delta-verify-every 0
 ```
 
-This path requires non-colocated execution and unquantized rollout weights; TP2/PP2/EP2 requires the matching vLLM-Ascend sparse receiver.
-The gather trigger is based only on globally ordered parameter-row counts, keeping collective
-order identical on every Megatron rank. Keep `verify-every` at zero: the native
-receiver does not expose a rank-local verification option, and nonzero values are rejected.
+This path requires non-colocated, unquantized ND rollout weights and inference
+PP=1, with EPLB disabled. Configure `--vllm-pipeline-parallel-size 1`.
+The native receiver handles TP/DP/EP loading; inference PP>1 is rejected before
+communication initialization. Training-side PP/TP/EP export remains supported.
+Keep `verify-every` at zero because the native receiver has no rank-local verifier.
 
-Parallel rollout:
-
-The NPU image patch includes the `sparse_hccl` receiver registration and modules.
-All receivers consume every broadcast before filtering PP-owned layers. The native
-checkpoint loader handles TP slicing, fused parameters and expert placement; an
-exception-safe temporary view restores Ascend MoE checkpoint orientation while loading.
-Trainer payloads use actual-length P2P aggregation to rank zero; rollout payloads are still broadcast;
-PP/EP ownership filtering does not imply rank-targeted network traffic.
-
-For Qwen3-30B-A3B with training and rollout TP2/PP2/EP2, use
-`scripts/run-qwen3-30B-A3B-sparse-hccl.sh`. Set `MODEL_PATH`,
-`PROMPT_DATA_PATH`, and the dependency `PYTHONPATH` for your environment. The script
-uses four training and four rollout devices with native receiver verification disabled.
+The script `scripts/run-qwen3-30B-A3B-sparse-hccl.sh` uses training
+TP2/PP2/EP2 and rollout TP4/PP1/EP4, on four training plus four rollout NPUs.
+Set `MODEL_PATH`, `PROMPT_DATA_PATH`, and the matching patched dependency paths.
+VIME normalizes contiguous payloads onto the communicator device and validates
+them before invoking the unmodified trainer engine.
 
 Disk transport configuration:
 
@@ -66,43 +60,42 @@ Deltas are always zstd-compressed (level 1); profiling showed it dominates lz4 /
 
 ### Sparse HCCL
 
-1. For the first sync, the synchronization adapter reuses full mode's existing `HfWeightIteratorDirect`, the dense HCCL sender, and the public dense checkpoint loader. No index tensors or NaN staging are needed. All training ranks participate in export; only rank 0 sends. Bridge still provides the sparse export index. Neither exporter implementation changes, and this does not enable MoE direct writes. Each rank captures its local Megatron shard snapshot in host memory only after initialization completes.
+1. Build the export index using Megatron-Bridge. First-sync full exports also use
+   `HfWeightIteratorSparseBridge`; this sparse path does not call the direct exporter.
+2. Represent every initial checkpoint position as an int32 index and target value,
+   split by the wire byte budget, and call native `send_weight_chunk`. This seeds
+   actual training weights even after reconnecting to previously modified workers.
+   It requires full-shape NaN staging on the native receiver and costs more wire
+   bytes than a dense values-only seed.
+3. Capture local shard snapshots only after successful initialization. Later syncs
+   use bitwise diff and the real Bridge mappings with NaN probes to produce final
+   checkpoint coordinates. Ordered variable-length gather merges them on rank zero.
+4. VIME checks shape/dtype, bounds, duplicate indices and NaNs before transmission,
+   then normalizes device and contiguity. The native sender owns metadata and the
+   concurrent receive RPC/broadcast; VIME owns pause/start/finish/resume.
+5. The native receiver uses temporary checkpoint-compatible MoE views and the model's
+   original loader for TP/EP placement. There is no Ascend MoE direct-write path.
+   Values replace positions, including zero; they are not additive deltas.
+6. The current native loader's int32 boundary restriction is enforced explicitly:
+   each checkpoint tensor must contain fewer than `2**31` elements. Wire indices
+   remain int32. Input validation and dedicated correctness oracles stay enabled.
 
-2. Later syncs bit-diff each current shard against its snapshot through an integer view, then advance the snapshot immediately.
-3. A NaN probe maps local changes to final HF names and global flat indices. PP non-owners, DP/CP replicas, and unchanged ranks retain zero-count lockstep directory rows.
-4. TP, EP/ETP, and PP/VPP ranks execute batched variable-length gathers over one common directory. The wire master constructs public `SparseWeightPatch` objects and sends bounded lists through `send_weight_chunk`.
-5. The receiver validates checkpoint patches and uses native weight loaders to update live weights in place. Independent correctness tests compare reconstructed/full exports and receiver parameter hashes against dense loading. A potentially partial update failure prevents updater reuse until recovery.
+Both dependency patches must be installed together. The two sparse engine classes
+and native example/test modules follow Ascend #18915 `f6ad8bd5`; pinned model code
+retains the compatible checkpoint loader-view backport. Sparse transport is unpacked.
+The native receiver does not implement inference PP filtering or VIME MoE direct writes.
 
-Set `VIME_SPARSE_MOE_DIRECT=1` in rollout worker environments to enable optional
-Qwen3-MoE direct writes (default: disabled). After common validation, supported
-BF16/ND static-EP expert patches are grouped by runtime `w13`/`w2` parameter and
-written in inference layout. This avoids full-shape NaN staging and skips
-nonlocal experts. Other parameters and unsupported layouts retain native loading;
-temporary loader transpose views are entered only for that fallback. Dense seed,
-wire payloads, sender validation, and training diff/gather are unchanged.
+For an independent receiver oracle, run the dependency's
+`tests/e2e/pull_request/eight_card/test_sparse_hccl_checkpoint.py` on five available
+NPUs. It tests TP4/DP1/EP4 and TP2/DP2/EP4 and compares worker hashes and greedy
+generation against native checkpoint loading. Small synthetic tests are not 30B
+accuracy or performance measurements.
 
-Sparse transport uses the non-packed path. Every PP worker consumes all broadcasts before
-filtering its parameters. Both image dependency patches must be installed together.
-
-The patched Ascend test `tests/e2e/pull_request/eight_card/test_sparse_hccl_checkpoint.py`
-includes a `restore-normal` case. Run it with `pytest -s` and
-`-k 'restore-normal and tp2-pp2-ep2'` on five available NPUs. It keeps an
-independent normal checkpoint, subtracts random changes at random coordinates
-and shard boundaries to construct a perturbed base, and restores it through
-sparse HCCL. The sparse transfer must reproduce every worker's full parameter
-hashes and deterministic generated tokens. Patch values are replacement target
-values, not additive differences. This small synthetic Qwen3-MoE case checks
-protocol correctness, not pretrained-model accuracy or performance.
-
-For a separate attribution run, set `VLLM_WEIGHT_TRANSFER_PROFILE=1` in both trainer
-and rollout worker environments. `WEIGHT_TRANSFER_PROFILE` records cumulative
-seconds and call counts for each phase and rank. Profiling synchronizes the device;
-use a run with profiling disabled for throughput comparisons. Inclusive parent
-phases overlap their child phases and must not be summed together; compare ranks
-by their critical-path maximum, rather than summing worker times.
-`receiver_apply` waits for completed device work. Its per-tensor child phases
-ending in `_host_dispatch` measure host residence (including implicit waits)
-without adding device synchronization; they are not isolated kernel timings.
+`VLLM_WEIGHT_TRANSFER_PROFILE=1` records VIME adapter phases; profile runs synchronize
+devices and must be separate from throughput measurements. Gather/publish phases
+include nested work and waits, so do not add overlapping durations. Updates are
+in-place and nontransactional; a possibly partial failure prevents updater reuse
+until reconnection and full seeding. Keep generation paused after such a failure.
 
 ### Disk transport
 

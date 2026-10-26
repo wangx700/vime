@@ -92,7 +92,7 @@ OPTIMIZER_ARGS=(
 
 VLLM_ARGS=(
    --rollout-num-gpus-per-engine 4
-   --vllm-pipeline-parallel-size 2
+   --vllm-pipeline-parallel-size 1
    --vllm-gpu-memory-utilization "${VLLM_GPU_MEMORY_UTILIZATION:-0.6}"
    --vllm-enforce-eager
    --vllm-enable-expert-parallel
@@ -120,7 +120,7 @@ MISC_ARGS=(
    --no-gradient-accumulation-fusion
 )
 
-RESULT_LOG="${RESULT_LOG:-qwen3-30b-tp2-pp2-ep2-sparse-hccl.log}"
+RESULT_LOG="${RESULT_LOG:-qwen3-30b-train-tp2-pp2-ep2-rollout-tp4-pp1-ep4-sparse-hccl.log}"
 if ! ray status --address="127.0.0.1:${RAY_GCS_PORT:-6523}" >/dev/null 2>&1; then
 ray start --head --port="${RAY_GCS_PORT:-6523}" --temp-dir="${RAY_TEMP_DIR:-/tmp/vime-tp2-pp2-ep2}" \
    --node-ip-address 127.0.0.1 --disable-usage-stats --dashboard-host=0.0.0.0 \

@@ -3,8 +3,9 @@
 Delta 权重同步只发送两次同步之间发生变化的字节，而不是每次都写一份完整 checkpoint，以此让非 colocate 的 rollout engine 保持最新。它面向大模型、跨集群或跨数据中心的训推解耦场景——这种场景下每次都写整份 actor 权重是主要开销。
 
 它支持两条传输路径：`disk` 面向跨集群共享存储，`sparse_hccl` 面向 Ascend
-训练和 vLLM-Ascend rollout 之间的在线传输。`sparse_hccl` 首次通过 dense HCCL 发送完整值，
-后续在同一通信组中仅发送变化位置的索引和值。
+训练和 vLLM-Ascend rollout 之间的在线传输。`sparse_hccl` 使用 #18915 的两个原生引擎；
+首次通过标准 sparse 协议发送全部 checkpoint 坐标，后续只发送变化坐标。
+首次全量导出和后续增量索引都使用 Megatron-Bridge。
 
 ## 配置
 
@@ -17,22 +18,15 @@ Sparse HCCL：
 --update-weight-delta-verify-every 0
 ```
 
-该路径要求非 colocate 和未量化 rollout 权重；TP2/PP2/EP2 需要匹配的 vLLM-Ascend sparse 接收端。`batch-gather` 只按全局
-参数目录的行数触发，保证所有 Megatron rank 的 collective 顺序一致。
-`verify-every` 必须为零：原生接收端不提供 rank-local 写入校验选项，非零值会被明确拒绝。
+该路径要求非 colocate、未量化 ND rollout 权重、关闭 EPLB，以及推理 PP=1；
+设置 `--vllm-pipeline-parallel-size 1`。原生接收端支持 TP/DP/EP，推理 PP>1
+在建组前明确拒绝。训练侧 PP/TP/EP 导出与 gather 保留。
+`verify-every` 必须为零，原生接收端不提供 rank-local 校验接口。
 
-并行 rollout：
-
-NPU 镜像补丁包含 `sparse_hccl` 接收端注册和模块。所有接收端先完成全部广播，再过滤
-当前 PP stage 所属参数。原生 checkpoint loader 负责 TP 切片、融合参数和 expert 放置；
-加载期间临时暴露 Ascend MoE 的 checkpoint 视图，并在异常或结束时恢复推理布局。
-训练侧 payload 按真实长度 P2P 汇聚到 rank0，推理侧仍采用广播；
-PP/EP 所属关系过滤不等于按 rank 定向传输。
-
-Qwen3-30B-A3B 训练和 rollout 均为 TP2/PP2/EP2 时，可使用
-`scripts/run-qwen3-30B-A3B-sparse-hccl.sh`。按环境设置 `MODEL_PATH`、
-`PROMPT_DATA_PATH` 及依赖的 `PYTHONPATH`。脚本使用四张训练卡和四张 rollout 卡，
-使用原生协议，不启用接收端 rank-local 校验。
+脚本 `scripts/run-qwen3-30B-A3B-sparse-hccl.sh` 使用训练 TP2/PP2/EP2、
+推理 TP4/PP1/EP4，四张训练卡加四张推理卡。按环境设置 `MODEL_PATH`、
+`PROMPT_DATA_PATH` 和配套依赖路径。VIME 在调用原生训练引擎前完成输入校验、
+设备转换及连续化，不改写引擎的发送或接收实现。
 
 磁盘传输配置：
 
@@ -60,39 +54,34 @@ delta 始终用 zstd（level 1）压缩；profiling 显示对这类数据它在 
 
 ### Sparse HCCL
 
-1. 首次由同步适配层复用 full 模式已有的 `HfWeightIteratorDirect`，通过现有 dense HCCL 发送函数和公共 dense checkpoint loader 传输完整 Megatron→HF 导出值，不生成索引或 NaN staging。所有训练 rank 参与导出，只有 rank 0 发送。Bridge 继续用于增量索引，不修改两种导出器的实现；这与 MoE 直写无关。完成后才将各 rank 的本地 Megatron shard snapshot 保存在主机内存。
-2. 后续同步在每个 rank 上对当前 shard 和 snapshot 做整数视图的 bit-exact diff，并立即推进 snapshot。
-3. NaN probe 把本地变化映射成最终 HF 参数名和全局 flat index。PP 非 owner、DP/CP 重复副本和无变化 rank 仍发送 count=0 的目录行。
-4. TP、EP/ETP、PP/VPP 按统一目录执行 batched variable-length gather；wire master 构造公共 `SparseWeightPatch`，通过 `send_weight_chunk` 发送有界列表。
-5. 接收端校验 checkpoint patch，并通过原生 weight loader 原地更新 live weights。独立正确性测试将重建结果与 full export 比较，并将接收端完整参数摘要与 dense 加载比较。发生可能部分写入的失败后，updater 在恢复前不可复用。
+1. 通过 Megatron-Bridge 建立导出索引。首轮全量也使用
+   `HfWeightIteratorSparseBridge`，sparse 路径不调用直接映射导出器。
+2. 为首轮实际训练权重生成完整 int32 checkpoint 坐标与目标值，按字节预算分片，
+   使用原生 `send_weight_chunk` 发送。重连后也能覆盖旧 worker 状态，不假定其
+   仍等于初始 checkpoint。接收端仍需完整形状 NaN staging，首轮 wire 大于 dense 值传输。
+3. 首轮成功后才捕获本地 shard snapshot。后续 bitwise diff 通过真实 Bridge 映射及
+   NaN probe 生成最终 checkpoint 坐标，再按一致目录执行变长 gather 到 rank0。
+4. VIME 在通信前检查名称、形状、dtype、边界、重复索引及 NaN，并将 tensor 转到
+   communicator device 且连续。原生 sender 管理 metadata 和并发接收 RPC/broadcast；
+   VIME 管理 pause/start/finish/resume。
+5. 接收端通过临时 checkpoint-compatible MoE 视图调用模型原生 loader，处理 TP/EP
+   放置；不启用 Ascend MoE 直写。values 是目标值覆盖，零也必须写，不是加法 delta。
+6. 显式限制单个 checkpoint tensor 元素数小于 `2**31`，规避当前原生 loader 的
+   int32 大张量边界限制。wire 仍为 int32；输入校验和独立正确性 oracle 保留。
 
-在 rollout worker 环境中设置 `VIME_SPARSE_MOE_DIRECT=1` 可启用 Qwen3-MoE
-直写，默认关闭。公共校验通过后，支持的 BF16/ND 静态 EP 专家 patch 按 runtime
-`w13`/`w2` 参数分组，在推理布局下直接写入，避免完整形状的 NaN staging，并跳过
-非本地专家。其他参数及不支持的布局继续走原生 loader，仅回退加载时进入临时转置视图。
-首次 dense seed、线上传输内容、发送端校验和训练侧 diff/gather 保持原流程。
+两份依赖 patch 必须配套安装。两个 sparse 引擎与原生示例/测试模块固定到
+#18915 `f6ad8bd5`；固定模型源码保留兼容的 loader-view 回移。
+传输为非 packed；原生接收器不包含推理 PP 过滤或 VIME MoE 直写。
 
-所有 PP worker 都消费完整广播后再过滤本 stage 参数。镜像中的两份依赖 patch 必须配套安装。
+独立接收 oracle 位于依赖的
+`tests/e2e/pull_request/eight_card/test_sparse_hccl_checkpoint.py`，需五张可用 NPU；
+覆盖 TP4/DP1/EP4 和 TP2/DP2/EP4，将全部 worker 参数 hash 和 greedy token
+与原生 checkpoint 加载比较。小型合成测试不代表 30B 精度或性能结论。
 
-恢复正常权重的端到端用例位于依赖 patch 中的
-`tests/e2e/pull_request/eight_card/test_sparse_hccl_checkpoint.py`。
-在已安装配套依赖的 vllm-ascend 目录运行：
-
-```bash
-pytest -s tests/e2e/pull_request/eight_card/test_sparse_hccl_checkpoint.py -k 'restore-normal and tp2-pp2-ep2'
-```
-
-该用例需要五张空闲 NPU（一个发送端、四个 TP2/PP2/EP2 接收 worker）。
-它保存独立正常 checkpoint，在随机位置及分片边界用随机变化量构造扰动基础模型，
-通过 sparse HCCL 恢复后，要求所有 worker 的完整参数摘要及确定性生成 token 与正常模型一致。
-稀疏传输仅使用非 packed 路径。`SparseWeightPatch.values` 是变更位置的目标值，
-不是待相加的差值；因此发送正常 checkpoint 的对应值，避免 BF16 减后再加的舍入误差。
-此用例使用小型合成 Qwen3-MoE 验证协议与映射正确性，不表示预训练模型精度或性能结论。
-
-单独进行耗时归因时，在 trainer 和 rollout worker 环境中设置 `VLLM_WEIGHT_TRANSFER_PROFILE=1`。
-`WEIGHT_TRANSFER_PROFILE` 按阶段和 rank 记录累计秒数、调用次数。计时会同步设备，性能对照应关闭计时重新运行。
-父阶段包含子阶段，不能直接相加；跨 rank 应分析关键路径上的最大耗时，不能累加所有 worker 的时间。
-`receiver_apply` 等待设备工作完成；内部以 `_host_dispatch` 结尾的逐参数阶段只记录主机停留时间（包括隐式等待），不额外同步设备，也不代表单独的 kernel 执行时间。
+`VLLM_WEIGHT_TRANSFER_PROFILE=1` 记录 VIME 适配层阶段。profiling 会同步设备，
+应与吞吐测量分开。gather/publish 含嵌套工作和等待，重叠阶段不能相加。
+更新原地执行、不具备事务回滚；发生可能部分写入的失败后保持暂停，
+updater 不得继续复用，必须重连并重新全量 seed。
 
 ### 磁盘传输
 

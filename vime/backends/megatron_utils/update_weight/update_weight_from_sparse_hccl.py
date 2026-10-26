@@ -1,4 +1,4 @@
-"""verl-style Megatron delta synchronization over Sparse HCCL."""
+"""Megatron synchronization through the unmodified #18915 sparse engines."""
 
 from __future__ import annotations
 
@@ -24,7 +24,6 @@ from vime.utils.distributed_utils import get_gloo_group
 from .common import VimeRayWeightSyncClient
 from .delta_sync import gather_slot_entries_to_rank0
 from .delta_sync.sparse_gather import GatherWorkspace
-from .hf_weight_iterator_direct import HfWeightIteratorDirect
 from .hf_weight_iterator_sparse_bridge import HfWeightIteratorSparseBridge
 from .megatron_delta_export import (
     build_export_index,
@@ -34,6 +33,44 @@ from .megatron_delta_export import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def prepare_native_sparse_patches(patches: Sequence[SparseWeightPatch], device) -> list[SparseWeightPatch]:
+    """Validate and normalize before the native engine starts worker RPCs.
+
+    #18915 deliberately leaves device/contiguity preparation to the caller.
+    Numeric flags are read once per chunk rather than once per parameter.
+    """
+    prepared = []
+    checks = []
+    for patch in patches:
+        if not isinstance(patch.name, str) or not patch.name:
+            raise ValueError("Sparse checkpoint name must be non-empty")
+        if patch.full_shape is None or any(type(dim) is not int or dim < 0 for dim in patch.full_shape):
+            raise ValueError(f"Invalid sparse checkpoint shape: {patch.name}")
+        numel = prod(patch.full_shape)
+        if numel >= 2**31:
+            raise ValueError(f"Native sparse loader requires checkpoint tensors smaller than 2**31 elements: {patch.name}")
+        if patch.indices.dtype != torch.int32 or patch.indices.ndim != 1 or patch.values.ndim != 1:
+            raise ValueError(f"Sparse patches require 1D int32 indices and 1D values: {patch.name}")
+        if patch.indices.numel() != patch.values.numel():
+            raise ValueError(f"Sparse indices and values must have matching lengths: {patch.name}")
+        if patch.values.dtype not in (torch.float16, torch.bfloat16, torch.float32, torch.float64):
+            raise ValueError(f"Sparse values must have floating dtype: {patch.name}")
+        indices = patch.indices.to(device=device).contiguous()
+        values = patch.values.to(device=device).contiguous()
+        if indices.numel():
+            wide = indices.to(torch.int64)
+            ordered = torch.sort(indices).values
+            checks.extend([
+                ((wide < 0) | (wide >= numel)).any(),
+                (ordered[1:] == ordered[:-1]).any(),
+                torch.isnan(values).any(),
+            ])
+        prepared.append(SparseWeightPatch(patch.name, indices, values, tuple(patch.full_shape)))
+    if checks and torch.stack(checks).any().item():
+        raise ValueError("Sparse payload contains out-of-range or duplicate indices, or NaN values")
+    return prepared
 
 
 class _GatherQueue:
@@ -142,7 +179,7 @@ class _SparseFlushBucket:
 
 
 class UpdateWeightFromSparseHCCL:
-    """Dense seed followed by shard-local sparse delta synchronization."""
+    """Full-coordinate seed and sparse deltas using the same public engine API."""
 
     def __init__(
         self,
@@ -159,6 +196,10 @@ class UpdateWeightFromSparseHCCL:
             raise NotImplementedError("Sparse HCCL delta sync does not support quantized rollout weights")
         if args.colocate:
             raise ValueError("Sparse HCCL delta sync requires non-colocated rollout engines")
+        if int(getattr(args, "vllm_pipeline_parallel_size", 1) or 1) != 1:
+            raise ValueError("Native #18915 sparse HCCL requires inference pipeline_parallel_size=1")
+        if int(getattr(args, "vllm_prefill_context_parallel_size", 1) or 1) != 1:
+            raise ValueError("Native #18915 sparse HCCL requires inference prefill_context_parallel_size=1")
         self.args = args
         self.model = model
         self.weights_getter = weights_getter
@@ -167,7 +208,6 @@ class UpdateWeightFromSparseHCCL:
         self.weight_version = 0
         self.update_weight_metrics: dict[str, float] = {}
         self._iterator = HfWeightIteratorSparseBridge(args, model)
-        self._seed_iterator = None
         self._index = None
         self._snapshots: dict[str, torch.Tensor] = {}
         self._seeded = False
@@ -188,7 +228,12 @@ class UpdateWeightFromSparseHCCL:
         engine_gpu_offsets: Sequence[int] | None = None,
         engine_parallel_configs: Sequence[Mapping[str, object]] | None = None,
     ) -> None:
-        del rollout_engine_lock, engine_gpu_offsets, engine_parallel_configs
+        del rollout_engine_lock, engine_gpu_offsets
+        for config in engine_parallel_configs or ():
+            if int(config.get("pipeline_parallel_size", config.get("pp_size", 1)) or 1) != 1:
+                raise ValueError("Native #18915 sparse HCCL does not support inference PP>1")
+            if int(config.get("prefill_context_parallel_size", config.get("pcp_size", 1)) or 1) != 1:
+                raise ValueError("Native #18915 sparse HCCL does not support inference prefill context parallelism")
         self.disconnect_rollout_engines()
         self._seeded = False
         self._failed = False
@@ -309,35 +354,45 @@ class UpdateWeightFromSparseHCCL:
         if dist.get_rank() != 0 or not patches:
             return
         assert self._client is not None and self._trainer is not None
-        # Native send_weight_chunk owns metadata and matching worker RPCs.
+        with self._profile.measure("trainer_prepare_native_payload"):
+            patches = prepare_native_sparse_patches(patches, self._trainer.model_update_group.device)
+        # Both seed and delta use #18915's unmodified public chunk API.
         # The surrounding VIME update owns start/finish and generation pause.
         self._payload_started = True
         self._trainer.send_weight_chunk(patches)
 
-    def _send_dense(self) -> tuple[int, int]:
-        """Bootstrap full checkpoint values without indices or NaN staging.
+    def _send_seed(self) -> tuple[int, int]:
+        """Send the actual training weights through native sparse patches.
 
-        Reuse the full updater's existing exporter. Bridge remains responsible
-        for the sparse export index; neither exporter implementation changes.
+        The public #18915 protocol has no dense flag or dense send method.
+        Full coordinates seed new/reconnected workers without assuming that
+        their current runtime parameters still equal the initial checkpoint.
         """
         statistics = {"flushes": 0, "wire_bytes": 0}
-        if self._seed_iterator is None:
-            # Construction gathers parameter metadata collectively. Every
-            # training rank must participate, including non-wire ranks.
-            self._seed_iterator = HfWeightIteratorDirect(
-                args=self.args,
-                model=self.model,
-                model_name=self.model_name,
-                quantization_config=self.quantization_config,
-            )
-        for chunk in self._seed_iterator.get_hf_weight_chunks(self.weights_getter(), progress_desc="Dense HCCL seed"):
+
+        def publish(patches):
+            self._publish_flush(patches)
+            statistics["flushes"] += 1
+            statistics["wire_bytes"] += sum(p.indices.numel() * (4 + p.values.element_size()) for p in patches)
+
+        bucket = _SparseFlushBucket(self.args.update_weight_buffer_size, publish)
+        # The same real Bridge used for probing exports the full seed. Every
+        # training rank participates, including non-wire PP/TP/EP ranks.
+        for chunk in self._iterator.get_hf_weight_chunks(progress_desc="Native sparse HCCL Bridge seed"):
             if dist.get_rank() != 0 or not chunk:
                 continue
-            self._payload_started = True
-            assert self._trainer is not None
-            self._trainer.send_dense_weight_chunk(chunk)
-            statistics["flushes"] += 1
-            statistics["wire_bytes"] += sum(tensor.numel() * tensor.element_size() for _, tensor in chunk)
+            for name, tensor in chunk:
+                flat = tensor.reshape(-1)
+                if flat.numel() >= 2**31:
+                    raise ValueError(f"Native sparse loader requires checkpoint tensors smaller than 2**31 elements: {name}")
+                max_elements = max(self.args.update_weight_buffer_size // (4 + flat.element_size()), 1)
+                for start in range(0, flat.numel(), max_elements):
+                    end = min(start + max_elements, flat.numel())
+                    indices = torch.arange(start, end, dtype=torch.int32, device=flat.device)
+                    bucket.add(name, tensor.shape, indices, flat[start:end])
+            # Export buffers may be reused by the iterator on its next yield.
+            # Complete all sends before advancing to the next export chunk.
+            bucket.flush()
         return statistics["flushes"], statistics["wire_bytes"]
 
     def _send_sparse_delta(self) -> tuple[int, int, int]:
@@ -425,7 +480,7 @@ class UpdateWeightFromSparseHCCL:
                 validate_export_weights(self._index)
             if not self._seeded:
                 with self._profile.measure("trainer_seed_export_send"):
-                    flushes, wire_bytes = self._send_dense()
+                    flushes, wire_bytes = self._send_seed()
                 assert self._index is not None
                 with self._profile.measure("trainer_seed_snapshot"):
                     prime_delta_snapshots(self._index, self._snapshots, pin=True)
