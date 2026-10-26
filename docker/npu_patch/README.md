@@ -79,10 +79,10 @@ registered under the `sparse_hccl` backend name. With these patches applied and
 --update-weight-mode delta --update-weight-transport sparse_hccl
 ```
 
-The first sync bootstraps complete values over dense HCCL; later syncs send only
-changed indices and values on the same communication group. It requires
-non-colocated, unquantized rollout weights, and TP/PP/EP > 1 needs the matching
-sparse receiver. See `docs/en/advanced/delta-weight-sync.md` for the knobs and
+The first sync sends complete values with full int32 coordinates through the
+native sparse chunk API; later syncs send changed coordinates and values on the
+same communication group. It requires non-colocated, unquantized rollout weights
+and inference PP=1, PCP=1. See `docs/en/advanced/delta-weight-sync.md` for the knobs and
 the trade-offs against the `disk` transport.
 
 ### 2. Megatron-LM
