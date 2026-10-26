@@ -95,6 +95,7 @@ VLLM_ARGS=(
    --vllm-pipeline-parallel-size 1
    --vllm-gpu-memory-utilization "${VLLM_GPU_MEMORY_UTILIZATION:-0.6}"
    --vllm-enforce-eager
+   --vllm-enable-scale-out
    --vllm-enable-expert-parallel
    --vllm-expert-placement-strategy linear
    --vllm-additional-config '{"weight_nz_mode":0}'
