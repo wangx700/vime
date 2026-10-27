@@ -130,7 +130,6 @@ ray start --head --port="${RAY_GCS_PORT:-6523}" --temp-dir="${RAY_TEMP_DIR:-/tmp
 fi
 
 ray job submit --address="http://127.0.0.1:${RAY_DASHBOARD_PORT:-8393}" \
-   --runtime-env-json="$(python3 -c 'import json,os; print(json.dumps({"working_dir":os.getcwd(),"env_vars":{k:os.environ[k] for k in ("PYTHONPATH","LD_LIBRARY_PATH","ASCEND_RT_VISIBLE_DEVICES","ASCEND_CUSTOM_OPP_PATH","VIME_PLATFORM","VLLM_USE_V2_MODEL_RUNNER","VLLM_KV_CACHE_LAYOUT","RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES","CUDA_DEVICE_MAX_CONNECTIONS","HCCL_HOST_SOCKET_PORT_RANGE","HCCL_NPU_SOCKET_PORT_RANGE","HCCL_CONNECT_TIMEOUT","DISABLE_L2_CACHE","HYDRA_FULL_ERROR","VLLM_ASCEND_ENABLE_NZ","VLLM_USE_AOT_COMPILE","PYTHONUNBUFFERED") if k in os.environ}}))')" \
    -- python3 train.py \
    --actor-num-nodes 1 \
    --actor-num-gpus-per-node 4 \
