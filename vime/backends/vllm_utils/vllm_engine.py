@@ -37,24 +37,6 @@ def get_base_gpu_id(args, rank):
     return start_index
 
 
-def _engine_visible_devices(base: int, count: int, *, base_is_physical: bool) -> str:
-    """Select NPU IDs in the same physical-ID order as placement groups."""
-    visible = os.environ.get("ASCEND_RT_VISIBLE_DEVICES")
-    if not current_platform().is_npu or not visible:
-        return ",".join(str(base + i) for i in range(count))
-    devices = sorted(int(value.strip()) for value in visible.split(",") if value.strip())
-    if len(set(devices)) != len(devices):
-        raise ValueError("ASCEND_RT_VISIBLE_DEVICES contains duplicate device IDs")
-    try:
-        offset = devices.index(base) if base_is_physical else base
-    except ValueError as error:
-        raise ValueError(f"Ray-assigned NPU {base} is absent from ASCEND_RT_VISIBLE_DEVICES={visible}") from error
-    selected = devices[offset : offset + count]
-    if offset < 0 or len(selected) != count:
-        raise ValueError(f"Cannot select {count} NPUs from offset {offset} in ASCEND_RT_VISIBLE_DEVICES={visible}")
-    return ",".join(str(device) for device in selected)
-
-
 def launch_server_process(server_args_dict: dict) -> multiprocessing.Process:
     env = _build_subprocess_env(server_args_dict)
     kwargs = {k: v for k, v in server_args_dict.items() if not k.startswith("_")}
@@ -766,7 +748,7 @@ def _compute_server_args(
     kwargs["_args"] = args
     kwargs["_rank"] = rank
     kwargs["_worker_type"] = worker_type
-    kwargs["_visible_devices"] = _engine_visible_devices(base, local_num_gpus, base_is_physical=base_gpu_id is not None)
+    kwargs["_visible_devices"] = ",".join(str(base + i) for i in range(local_num_gpus))
     kwargs["_tp_size"] = tp
     kwargs["_pp_size"] = pp
     kwargs["_pcp_size"] = pcp

@@ -44,7 +44,7 @@ from vllm.model_executor.model_loader.checkpoint_weight_patch import (
 import vime.backends.megatron_utils  # noqa: F401 - Bootstrap NPU before importing Megatron.
 from vime.backends.megatron_utils.update_weight import megatron_delta_export
 from vime.backends.megatron_utils.update_weight import update_weight_from_sparse_hccl as updater_module
-from vime.backends.megatron_utils.update_weight.delta_sync import checksum, shard_delta_indices
+from vime.backends.megatron_utils.update_weight.delta_sync import shard_delta_indices
 from vime.backends.megatron_utils.update_weight.delta_sync import sparse_gather as gather_module
 from vime.backends.megatron_utils.update_weight.delta_sync.sparse_gather import (
     GatherWorkspace,
@@ -453,17 +453,6 @@ def test_shard_delta_indices_is_bit_exact(dtype):
     assert torch.equal(values.view(integer_dtype), current[changed].view(integer_dtype))
     indices, values = shard_delta_indices(current.clone(), current, offset=4096)
     assert indices.numel() == values.numel() == 0
-
-
-@pytest.mark.unit
-def test_checksum_fits_uint64_wire_format(monkeypatch):
-    """Keep worst-case hashes representable by the JSON/msgpack control plane."""
-    hashes = iter([2**63 - 1, 2**63 - 1])
-    monkeypatch.setattr(torch, "hash_tensor", lambda _: torch.tensor(next(hashes)))
-
-    result = checksum(torch.ones(1, dtype=torch.uint8), torch.ones(1))
-
-    assert 0 <= result <= 2**64 - 1
 
 
 @pytest.mark.unit

@@ -23,8 +23,8 @@ Sparse HCCL：
 `verify-every` 必须为零，接收端不提供 rank-local 校验接口。
 
 脚本 `scripts/run-qwen3-30B-A3B-sparse-hccl.sh` 使用训练 TP2/PP2/EP2、
-推理 TP2/PP1/EP2，四张训练卡加两张推理卡。按环境设置 `MODEL_PATH`、
-`PROMPT_DATA_PATH` 和配套依赖路径。VIME 在调用训练引擎前完成输入校验、
+推理 TP2/PP1/EP2，四张训练卡加两张推理卡。设置 `DATA_ROOT` 指向包含
+`weights/` 和 `datasets/` 的目录，运行前加载 NPU 环境。VIME 在调用训练引擎前完成输入校验、
 设备转换及连续化，不改写引擎的发送或接收实现。
 
 磁盘传输配置：

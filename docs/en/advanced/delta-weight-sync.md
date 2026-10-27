@@ -30,7 +30,8 @@ Keep `verify-every` at zero because the receiver has no rank-local verifier.
 
 The script `scripts/run-qwen3-30B-A3B-sparse-hccl.sh` uses training
 TP2/PP2/EP2 and rollout TP2/PP1/EP2, on four training plus two rollout NPUs.
-Set `MODEL_PATH`, `PROMPT_DATA_PATH`, and the matching patched dependency paths.
+Set `DATA_ROOT` to the directory containing `weights/` and `datasets/`, and load
+the NPU environment before running the script.
 VIME normalizes contiguous payloads onto the communicator device and validates
 them before invoking the trainer engine.
 

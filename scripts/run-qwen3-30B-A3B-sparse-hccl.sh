@@ -1,53 +1,45 @@
 #!/bin/bash
 
-# Isolated validation variant: it does not stop processes outside this run.
-set -euo pipefail
-set -x
+set -ex
 
 export PYTHONUNBUFFERED=1
+export ASCEND_RT_VISIBLE_DEVICES="${ASCEND_RT_VISIBLE_DEVICES:-0,1,2,3,4,5}"
 export RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES=1
 export CUDA_DEVICE_MAX_CONNECTIONS=1
-export HCCL_HOST_SOCKET_PORT_RANGE="${HCCL_HOST_SOCKET_PORT_RANGE:-64000-64050}"
-export HCCL_NPU_SOCKET_PORT_RANGE="${HCCL_NPU_SOCKET_PORT_RANGE:-64100-64150}"
+export HCCL_HOST_SOCKET_PORT_RANGE=60000-60050
+export HCCL_NPU_SOCKET_PORT_RANGE=61000-61050
 export HYDRA_FULL_ERROR=1
 export DISABLE_L2_CACHE=1
 export VLLM_ASCEND_ENABLE_NZ=0
 export VLLM_USE_AOT_COMPILE=0
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-VIME_REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
-cd "${VIME_REPO_ROOT}"
+export PYTHONPATH="/root/Megatron-LM/:${PYTHONPATH:-}"
 
 unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY
 
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 source "${SCRIPT_DIR}/models/qwen3-30B-A3B.sh"
 
-MODEL_PATH="${MODEL_PATH:?set MODEL_PATH to Qwen3-30B-A3B weights}"
-PROMPT_DATA_PATH="${PROMPT_DATA_PATH:?set PROMPT_DATA_PATH to the prompt JSONL}"
-NUM_ROLLOUT="${NUM_ROLLOUT:-3}"
-ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-2}"
-N_SAMPLES_PER_PROMPT="${N_SAMPLES_PER_PROMPT:-4}"
-ROLLOUT_MAX_RESPONSE_LEN="${ROLLOUT_MAX_RESPONSE_LEN:-512}"
-GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-8}"
+DATA_ROOT="${DATA_ROOT:-/root}"
 
 CKPT_ARGS=(
-   --hf-checkpoint "${MODEL_PATH}"
-   --load "${MODEL_PATH}"
-   --ref-load "${MODEL_PATH}"
+   --hf-checkpoint ${DATA_ROOT}/weights/Qwen3-30B-A3B/
+   --load ${DATA_ROOT}/weights/Qwen3-30B-A3B/
+   --ref-load ${DATA_ROOT}/weights/Qwen3-30B-A3B/
 )
 
 ROLLOUT_ARGS=(
-   --prompt-data "${PROMPT_DATA_PATH}"
+   --prompt-data ${DATA_ROOT}/datasets/dapo-math-17k/dapo-math-17k.jsonl
    --input-key prompt
    --label-key label
    --apply-chat-template
    --rollout-shuffle
-   --rm-type math
-   --num-rollout "${NUM_ROLLOUT}"
-   --rollout-batch-size "${ROLLOUT_BATCH_SIZE}"
-   --n-samples-per-prompt "${N_SAMPLES_PER_PROMPT}"
-   --rollout-max-response-len "${ROLLOUT_MAX_RESPONSE_LEN}"
+   --rm-type deepscaler
+   --num-rollout 3
+   --rollout-batch-size 2
+   --n-samples-per-prompt 4
+   --rollout-max-response-len 512
    --rollout-temperature 1
-   --global-batch-size "${GLOBAL_BATCH_SIZE}"
+   --global-batch-size 8
    --balance-data
 )
 
@@ -72,7 +64,7 @@ GRPO_ARGS=(
    --use-kl-loss
    --kl-loss-coef 0.00
    --kl-loss-type low_var_kl
-   --entropy-coef "${ENTROPY_COEF:-0.001}"
+   --entropy-coef 0.001
    --eps-clip 0.2
    --eps-clip-high 0.28
 )
@@ -91,22 +83,19 @@ OPTIMIZER_ARGS=(
 )
 
 VLLM_ARGS=(
+   --vllm-additional-config '{"weight_nz_mode":0}'
    --rollout-num-gpus-per-engine 2
+   --vllm-gpu-memory-utilization 0.6
    --vllm-pipeline-parallel-size 1
-   --vllm-gpu-memory-utilization "${VLLM_GPU_MEMORY_UTILIZATION:-0.6}"
-   --vllm-enforce-eager
-   --vllm-enable-scale-out
    --vllm-enable-expert-parallel
    --vllm-expert-placement-strategy linear
-   --vllm-additional-config '{"weight_nz_mode":0}'
+   --vllm-enable-scale-out
+   --vllm-enforce-eager
 )
 
 UPDATE_WEIGHT_ARGS=(
-   --update-weight-delta-batch-diff "${UPDATE_WEIGHT_DELTA_BATCH_DIFF:-32}"
-   --update-weight-delta-batch-gather "${UPDATE_WEIGHT_DELTA_BATCH_GATHER:-32}"
    --update-weight-mode delta
    --update-weight-transport sparse_hccl
-   --update-weight-delta-verify-every "${UPDATE_WEIGHT_DELTA_VERIFY_EVERY:-0}"
 )
 
 MISC_ARGS=(
@@ -121,15 +110,9 @@ MISC_ARGS=(
    --no-gradient-accumulation-fusion
 )
 
-RESULT_LOG="${RESULT_LOG:-qwen3-30b-train-tp2-pp2-ep2-rollout-tp2-pp1-ep2-sparse-hccl.log}"
-if ! ray status --address="127.0.0.1:${RAY_GCS_PORT:-6523}" >/dev/null 2>&1; then
-ray start --head --port="${RAY_GCS_PORT:-6523}" --temp-dir="${RAY_TEMP_DIR:-/tmp/vime-tp2-pp2-ep2}" \
-   --node-ip-address 127.0.0.1 --disable-usage-stats --dashboard-host=0.0.0.0 \
-   --dashboard-port="${RAY_DASHBOARD_PORT:-8393}" \
-   --dashboard-agent-listen-port="${RAY_DASHBOARD_AGENT_PORT:-52386}"
-fi
+ray start --head --num-gpus 0 --resources '{"NPU": 6}' --node-ip-address 127.0.0.1 --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port=8265
 
-ray job submit --address="http://127.0.0.1:${RAY_DASHBOARD_PORT:-8393}" \
+ray job submit --address="http://127.0.0.1:8265" \
    -- python3 train.py \
    --actor-num-nodes 1 \
    --actor-num-gpus-per-node 4 \
@@ -142,4 +125,4 @@ ray job submit --address="http://127.0.0.1:${RAY_DASHBOARD_PORT:-8393}" \
    ${PERF_ARGS[@]} \
    ${VLLM_ARGS[@]} \
    ${UPDATE_WEIGHT_ARGS[@]} \
-   ${MISC_ARGS[@]} 2>&1 | tee "${RESULT_LOG}"
+   ${MISC_ARGS[@]}
