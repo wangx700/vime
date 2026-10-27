@@ -11,41 +11,16 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Megatron-side delta export machinery, built on Megatron-Bridge param mappings.
+"""Export Megatron shard deltas in HF checkpoint coordinates via Megatron-Bridge.
 
-The delta engine consumes final HF-coordinate entries; everything mcore-specific
-lives here: enumerating parameters through :meth:`AutoBridge.get_conversion_tasks`,
-routing each parameter's entries to its wire merge group, and probing the
-bridge's own ``megatron_to_hf`` converters with NaN sentinels to translate a
-shard-local delta into HF coordinates.
+Build an ordered export index, compare local shards with snapshots, and
+convert changed entries using Bridge mappings with NaN sentinels. Probe
+mappings preserve parallel sizes and ranks while replacing collectives
+with local placeholders; unsupported communication raises an error.
 
-The probe never runs a collective, yet executes the mapping's REAL parallel
-code paths: a "group" carries two separable meanings -- its SIZE/RANK (which
-value math like Mamba's ``local_dim = global // tp_size`` consumes) and its
-COMMUNICATION. The probe copies keep the first faithful and replace only the
-second: groups become :class:`_ProbeGroup` (real size/rank, any actual use for
-communication raises), and the bridge's comm helpers are stubbed with local
-synthesis -- ``gather_from_tp_ranks`` returns this rank's shard at its true
-rank index with NaN placeholders for every other rank (their contributions are
-exported by those ranks' own probes). Feeding ``megatron_to_hf`` the LOCAL
-shard as a NaN buffer with the rank's own delta scattered in yields HF tensors
-whose non-NaN survivors are exactly this rank's contributions in final HF
-coordinates.
-
-Scope (asserted in the exporter): TP + EP + PP/VPP, no LoRA. Under PP the
-bridge's conversion tasks already enumerate the GLOBAL parameter directory
-(identical order on every rank, tied embeddings deduped, placeholders for
-other stages); non-owner ranks ship zero-count lockstep rows and every
-param merges over the WORLD group, so the wire master needs no relay.
-
-Safety boundary: communication must stay confined to the four stubbed helpers
-(``gather_from_tp_ranks`` / ``gather_from_ep_ranks[_scale]`` / the PP
-broadcasts, whose ``pp_size == 1`` fast path the probe keeps) -- anything else
-touching a probe group raises instead of skewing silently. The remaining
-assumption is that transforms REARRANGE elements rather than arithmetically
-BLEND chunks (blending would eat the NaN sentinels); the TP>1 differential
-test (real ``megatron_to_hf`` vs probe assembly, bitwise) is the regression
-oracle for both assumptions on every Megatron-Bridge upgrade.
+Supports TP, EP and PP/VPP; LoRA is excluded. Mappings must preserve
+individual values rather than blend contributions, so NaN sentinels remain
+valid. Bridge upgrades require differential validation against full export.
 """
 
 from __future__ import annotations
