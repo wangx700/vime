@@ -3,8 +3,7 @@
 Delta 权重同步只发送两次同步之间发生变化的字节，而不是每次都写一份完整 checkpoint，以此让非 colocate 的 rollout engine 保持最新。它面向大模型、跨集群或跨数据中心的训推解耦场景——这种场景下每次都写整份 actor 权重是主要开销。
 
 它支持两条传输路径：`disk` 面向跨集群共享存储，`sparse_hccl` 面向 Ascend
-训练和 vLLM-Ascend rollout 之间的在线传输。`sparse_hccl` 使用 #18915 的两个原生引擎；
-首次通过标准 sparse 协议发送全部 checkpoint 坐标，后续只发送变化坐标。
+训练和 vLLM-Ascend rollout 之间的在线传输。首次通过标准 sparse 协议发送全部 checkpoint 坐标，后续只发送变化坐标。
 首次全量导出和后续增量索引都使用 Megatron-Bridge。
 
 ## 配置
@@ -19,13 +18,13 @@ Sparse HCCL：
 ```
 
 该路径要求非 colocate、未量化 ND rollout 权重、关闭 EPLB，以及推理 PP=1；
-设置 `--vllm-pipeline-parallel-size 1`。原生接收端支持 TP/DP/EP，推理 PP>1
+设置 `--vllm-pipeline-parallel-size 1`。接收端支持 TP/DP/EP，推理 PP>1
 在建组前明确拒绝。训练侧 PP/TP/EP 导出与 gather 保留。
-`verify-every` 必须为零，原生接收端不提供 rank-local 校验接口。
+`verify-every` 必须为零，接收端不提供 rank-local 校验接口。
 
 脚本 `scripts/run-qwen3-30B-A3B-sparse-hccl.sh` 使用训练 TP2/PP2/EP2、
-推理 TP4/PP1/EP4，四张训练卡加四张推理卡。按环境设置 `MODEL_PATH`、
-`PROMPT_DATA_PATH` 和配套依赖路径。VIME 在调用原生训练引擎前完成输入校验、
+推理 TP2/PP1/EP2，四张训练卡加两张推理卡。按环境设置 `MODEL_PATH`、
+`PROMPT_DATA_PATH` 和配套依赖路径。VIME 在调用训练引擎前完成输入校验、
 设备转换及连续化，不改写引擎的发送或接收实现。
 
 磁盘传输配置：
@@ -57,26 +56,66 @@ delta 始终用 zstd（level 1）压缩；profiling 显示对这类数据它在 
 1. 通过 Megatron-Bridge 建立导出索引。首轮全量也使用
    `HfWeightIteratorSparseBridge`，sparse 路径不调用直接映射导出器。
 2. 为首轮实际训练权重生成完整 int32 checkpoint 坐标与目标值，按字节预算分片，
-   使用原生 `send_weight_chunk` 发送。重连后也能覆盖旧 worker 状态，不假定其
+   使用`send_weight_chunk` 发送。重连后也能覆盖旧 worker 状态，不假定其
    仍等于初始 checkpoint。接收端仍需完整形状 NaN staging，首轮 wire 大于 dense 值传输。
 3. 首轮成功后才捕获本地 shard snapshot。后续 bitwise diff 通过真实 Bridge 映射及
    NaN probe 生成最终 checkpoint 坐标，再按一致目录执行变长 gather 到 rank0。
-4. VIME 在通信前检查名称、形状、dtype、边界、重复索引及 NaN，并将 tensor 转到
-   communicator device 且连续。原生 sender 管理 metadata 和并发接收 RPC/broadcast；
+4. VIME 在通信前检查边界、重复索引及 NaN，并将 tensor 转到 communicator device
+   且连续；sender 负责 patch 结构检查、metadata 和并发接收 RPC/broadcast；
    VIME 管理 pause/start/finish/resume。
-5. 接收端通过临时 checkpoint-compatible MoE 视图调用模型原生 loader，处理 TP/EP
+5. 接收端通过临时 checkpoint-compatible MoE 视图调用模型 loader，处理 TP/EP
    放置；不启用 Ascend MoE 直写。values 是目标值覆盖，零也必须写，不是加法 delta。
-6. 显式限制单个 checkpoint tensor 元素数小于 `2**31`，规避当前原生 loader 的
+6. 显式限制单个 checkpoint tensor 元素数小于 `2**31`，规避当前 checkpoint loader 的
    int32 大张量边界限制。wire 仍为 int32；输入校验和独立正确性 oracle 保留。
 
-两份依赖 patch 必须配套安装。两个 sparse 引擎与原生示例/测试模块固定到
-#18915 `f6ad8bd5`；固定模型源码保留兼容的 loader-view 回移。
-传输为非 packed；原生接收器不包含推理 PP 过滤或 VIME MoE 直写。
+两份依赖 patch 必须配套安装。Sparse HCCL 采用 unpacked 传输。
 
-独立接收 oracle 位于依赖的
-`tests/e2e/pull_request/eight_card/test_sparse_hccl_checkpoint.py`，需五张可用 NPU；
-覆盖 TP4/DP1/EP4 和 TP2/DP2/EP4，将全部 worker 参数 hash 和 greedy token
-与原生 checkpoint 加载比较。小型合成测试不代表 30B 精度或性能结论。
+### 端到端权重与推理对照
+
+`tests/test_qwen3_30B_A3B_sparse_hccl_npu.py` 在四张卡上训练，向两张推理卡
+执行完整 seed 和非空 sparse delta；随后从最终训练模型经 Bridge 完整导出 HF
+checkpoint。它记录 sparse 更新后的 greedy 推理结果，关闭该推理进程，再在相同两张卡
+启动全新推理进程，直接加载导出的本地 checkpoint。两路使用完全相同的 prompt token IDs
+和采样参数，要求生成 token IDs 和每个 token 的 logprob 严格相等；缺失、非有限值或
+任意差异均失败。对照前也会重复推理一次，检查更新后的模型自身是否可精确复现。
+
+```bash
+MODEL_PATH=/mnt/weight/Qwen3-30B-A3B \
+PROMPT_DATA_PATH=/path/to/dapo-math-17k.jsonl \
+SPARSE_HCCL_RESULT_DIR=/local/nvme/sparse-check-001 \
+SPARSE_HCCL_BASELINE_PROMPT="What is 17 + 25? Give the answer in one sentence." \
+python tests/test_qwen3_30B_A3B_sparse_hccl_npu.py
+```
+
+结果目录必须是新目录，预留约 61 GB 保存完整 BF16 权重。产物包括 `baseline.json`、
+`sync-metrics.json`、`sparse-inference.json`、`checkpoint-inference.json` 和
+`comparison.json`。对比文件包含逐项相等判定和最大 logprob 绝对误差，严格通过要求误差
+为零。单个基线 prompt 的一致性结论仅覆盖该输入。
+
+每次同步还输出 `perf/update_weights_sparse_hccl_prepare_time`、
+`perf/update_weights_sparse_hccl_send_apply_time` 和
+`perf/update_weights_sparse_hccl_main_time`，单位均为秒。
+prepare 是 seed/delta 主流程中同步 `send_weight_chunk()` 调用之外的时间，send/apply
+包含等待推理接收 RPC 完成，两者相加等于 main。多次 flush 时，准备可能穿插在发送之间。
+索引建立、主流程前校验、seed 快照以及 begin/finish 在这个和式之外，但属于外层 Timer。
+
+### 当前 unpacked 实测基线
+
+2026-10-27 A5 六卡完整作业使用训练 TP2/PP2/EP2、推理 TP2/PP1/EP2。
+以下为索引校验优化前的结果，不能用于宣称本次新代码已获得性能提升。
+
+| 更新 | Full HCCL unpacked（秒） | Sparse HCCL（秒） | Sparse 更新元素 / 完整 seed | Sparse payload（MiB） |
+|---|---:|---:|---:|---:|
+| 首轮 seed | 63.7 | 100.8 | 100% | 174706.21 |
+| 第一次 delta | 52.4 | 31.0 | 0.1386% | 242.06 |
+| 第二次 delta | 52.8 | 36.9 | 0.2048% | 357.88 |
+| 第三次 delta | 52.5 | 37.4 | 0.2273% | 397.08 |
+
+表注：时间为完整 `update_weights` 墙钟区间，包括发送前处理、通信和推理应用。
+Full 每轮全量发送；Sparse 比例为标量更新事件数除以 seed 的 30532122624 个元素，
+不同轮可能重复更新同一坐标。payload 包含 int32 索引与 BF16 值，不含网络协议开销。
+稳态均值分别为 52.57 秒与 35.10 秒，Sparse 相对 unpacked Full 节省约 33.2%。
+这些历史作业未与全新 checkpoint 加载逐 token 对比 logprobs；上面的脚本新增了该严格验收。
 
 `VLLM_WEIGHT_TRANSFER_PROFILE=1` 记录 VIME 适配层阶段。profiling 会同步设备，
 应与吞吐测量分开。gather/publish 含嵌套工作和等待，重叠阶段不能相加。

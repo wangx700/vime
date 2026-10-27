@@ -7,7 +7,6 @@ import pytest
 
 from vime.backends.megatron_utils.update_weight import create_weight_updater
 
-from vime.utils.arguments import get_vime_extra_args_provider
 
 NUM_GPUS = 0
 
@@ -69,7 +68,7 @@ def test_create_weight_updater_selects_implementation(monkeypatch, mode, transpo
         model,
         weights_getter,
         model_name="model",
-        quantization_config={"quant_method": "test"},
+        quantization_config=None if transport == "sparse_hccl" else {"quant_method": "test"},
     )
 
     assert isinstance(updater, _FakeUpdater)
@@ -77,13 +76,15 @@ def test_create_weight_updater_selects_implementation(monkeypatch, mode, transpo
     assert updater.model is model
     assert updater.weights_getter is weights_getter
     assert updater.model_name == "model"
-    assert updater.quantization_config == {"quant_method": "test"}
+    assert updater.quantization_config == (None if transport == "sparse_hccl" else {"quant_method": "test"})
     assert updater.weight_version == 7
 
 
 @pytest.mark.unit
 @pytest.mark.parametrize("transport", ["nccl", "disk", "sparse_hccl"])
 def test_transport_options_are_registered_once(transport):
+    from vime.utils.arguments import get_vime_extra_args_provider
+
     parser = get_vime_extra_args_provider()(argparse.ArgumentParser())
     args = parser.parse_args(
         [
@@ -99,3 +100,18 @@ def test_transport_options_are_registered_once(transport):
     assert args.update_weight_delta_verify_every == 1
     assert args.update_weight_delta_batch_diff == 32
     assert args.update_weight_delta_batch_gather == 32
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "quantization,verify,error", [({"quant_method": "test"}, 0, NotImplementedError), (None, 1, ValueError)]
+)
+def test_sparse_options_rejected_before_import(quantization, verify, error):
+    args = Namespace(
+        update_weight_mode="delta",
+        update_weight_transport="sparse_hccl",
+        colocate=False,
+        update_weight_delta_verify_every=verify,
+    )
+    with pytest.raises(error):
+        create_weight_updater(args, [], lambda: {}, model_name="test", quantization_config=quantization)

@@ -7,7 +7,7 @@ every sync is the dominant cost.
 
 Two transports are available: `disk` for shared-storage and cross-cluster deployments, and
 `sparse_hccl` for online transfer between Ascend trainers and vLLM-Ascend rollout workers.
-Sparse HCCL uses the two native engines from vLLM-Ascend #18915. The first sync
+The first sync
 sends every checkpoint coordinate through the public sparse protocol; later syncs
 send only changed coordinates. Both seed and deltas are exported through Megatron-Bridge.
 
@@ -24,15 +24,15 @@ Sparse HCCL:
 
 This path requires non-colocated, unquantized ND rollout weights and inference
 PP=1, with EPLB disabled. Configure `--vllm-pipeline-parallel-size 1`.
-The native receiver handles TP/DP/EP loading; inference PP>1 is rejected before
+The receiver handles TP/DP/EP loading; inference PP>1 is rejected before
 communication initialization. Training-side PP/TP/EP export remains supported.
-Keep `verify-every` at zero because the native receiver has no rank-local verifier.
+Keep `verify-every` at zero because the receiver has no rank-local verifier.
 
 The script `scripts/run-qwen3-30B-A3B-sparse-hccl.sh` uses training
-TP2/PP2/EP2 and rollout TP4/PP1/EP4, on four training plus four rollout NPUs.
+TP2/PP2/EP2 and rollout TP2/PP1/EP2, on four training plus two rollout NPUs.
 Set `MODEL_PATH`, `PROMPT_DATA_PATH`, and the matching patched dependency paths.
 VIME normalizes contiguous payloads onto the communicator device and validates
-them before invoking the unmodified trainer engine.
+them before invoking the trainer engine.
 
 Disk transport configuration:
 
@@ -63,33 +63,81 @@ Deltas are always zstd-compressed (level 1); profiling showed it dominates lz4 /
 1. Build the export index using Megatron-Bridge. First-sync full exports also use
    `HfWeightIteratorSparseBridge`; this sparse path does not call the direct exporter.
 2. Represent every initial checkpoint position as an int32 index and target value,
-   split by the wire byte budget, and call native `send_weight_chunk`. This seeds
+   split by the wire byte budget, and call `send_weight_chunk`. This seeds
    actual training weights even after reconnecting to previously modified workers.
-   It requires full-shape NaN staging on the native receiver and costs more wire
+   It requires full-shape NaN staging on the receiver and costs more wire
    bytes than a dense values-only seed.
 3. Capture local shard snapshots only after successful initialization. Later syncs
    use bitwise diff and the real Bridge mappings with NaN probes to produce final
    checkpoint coordinates. Ordered variable-length gather merges them on rank zero.
-4. VIME checks shape/dtype, bounds, duplicate indices and NaNs before transmission,
-   then normalizes device and contiguity. The native sender owns metadata and the
+4. VIME normalizes device and contiguity and checks bounds, duplicate indices
+   and NaNs. The sender checks patch structure and owns metadata and the
    concurrent receive RPC/broadcast; VIME owns pause/start/finish/resume.
-5. The native receiver uses temporary checkpoint-compatible MoE views and the model's
+5. The receiver uses temporary checkpoint-compatible MoE views and the model's
    original loader for TP/EP placement. There is no Ascend MoE direct-write path.
    Values replace positions, including zero; they are not additive deltas.
-6. The current native loader's int32 boundary restriction is enforced explicitly:
+6. The checkpoint loader's int32 boundary restriction is enforced explicitly:
    each checkpoint tensor must contain fewer than `2**31` elements. Wire indices
    remain int32. Input validation and dedicated correctness oracles stay enabled.
 
-Both dependency patches must be installed together. The two sparse engine classes
-and native example/test modules follow Ascend #18915 `f6ad8bd5`; pinned model code
-retains the compatible checkpoint loader-view backport. Sparse transport is unpacked.
-The native receiver does not implement inference PP filtering or VIME MoE direct writes.
+Both dependency patches must be installed together. Sparse transport is unpacked.
 
-For an independent receiver oracle, run the dependency's
-`tests/e2e/pull_request/eight_card/test_sparse_hccl_checkpoint.py` on five available
-NPUs. It tests TP4/DP1/EP4 and TP2/DP2/EP4 and compares worker hashes and greedy
-generation against native checkpoint loading. Small synthetic tests are not 30B
-accuracy or performance measurements.
+### End-to-end checkpoint comparison
+
+`tests/test_qwen3_30B_A3B_sparse_hccl_npu.py` trains on four NPUs, performs a
+complete seed and nonempty sparse updates into a two-NPU rollout engine, and
+exports the final training weights as a full HF checkpoint through Bridge.
+It captures greedy inference, stops the rollout engine, and launches a fresh
+engine on the same two devices to load that checkpoint directly from disk.
+Both engines receive the same prompt token IDs and sampling parameters.
+Generated token IDs and every logprob must match exactly; a missing logprob,
+non-finite value or any mismatch fails the run. Repeat inference checks
+whether the updated engine is itself exactly repeatable first.
+
+```bash
+MODEL_PATH=/mnt/weight/Qwen3-30B-A3B \
+PROMPT_DATA_PATH=/path/to/dapo-math-17k.jsonl \
+SPARSE_HCCL_RESULT_DIR=/local/nvme/sparse-check-001 \
+SPARSE_HCCL_BASELINE_PROMPT="What is 17 + 25? Give the answer in one sentence." \
+python tests/test_qwen3_30B_A3B_sparse_hccl_npu.py
+```
+
+Use a fresh result directory with room for a full BF16 checkpoint (about 61 GB).
+Artifacts include `baseline.json`, `sync-metrics.json`, `sparse-inference.json`,
+`checkpoint-inference.json`, and `comparison.json`. The latter records exact
+matching and maximum absolute logprob error; an exact pass requires zero error.
+A one-prompt match covers that prompt, not all possible model inputs.
+
+Each sync also reports `perf/update_weights_sparse_hccl_prepare_time`,
+`perf/update_weights_sparse_hccl_send_apply_time` and
+`perf/update_weights_sparse_hccl_main_time` in seconds. Prepare time is the
+seed/delta main flow excluding synchronous `send_weight_chunk()` calls;
+send/apply time includes the receive RPC completion. These two intervals sum
+to main time. With multiple flushes, preparation can occur between sends.
+Index construction, validation before the main flow, seed snapshot capture,
+and update begin/finish remain outside this sum and inside the outer Timer.
+
+### Measured unpacked baseline
+
+The A5 six-NPU runs on 2026-10-27 completed the same training TP2/PP2/EP2 and
+rollout TP2/PP1/EP2 configuration. These measurements precede the ordered-index
+validation optimization; they do not establish a speedup for the new code.
+
+| Update | Full HCCL unpacked (s) | Sparse HCCL (s) | Sparse updated elements / seed | Sparse payload (MiB) |
+|---|---:|---:|---:|---:|
+| Initial seed | 63.7 | 100.8 | 100% | 174706.21 |
+| First delta | 52.4 | 31.0 | 0.1386% | 242.06 |
+| Second delta | 52.8 | 36.9 | 0.2048% | 357.88 |
+| Third delta | 52.5 | 37.4 | 0.2273% | 397.08 |
+
+Table note: seconds cover the complete `update_weights` wall-clock call, including
+preparation, transfer and receiver application. Full sends all weights each time.
+Sparse coverage counts scalar update events divided by 30532122624 seed elements;
+three deltas can update the same coordinate repeatedly. Payload includes int32
+indices and BF16 values, excluding protocol overhead. Steady means are 52.57 s
+and 35.10 s: sparse saves approximately 33.2% wall time against unpacked full.
+These runs did not compare generated-token logprobs with a fresh checkpoint load;
+that is the stricter acceptance check added by the script above.
 
 `VLLM_WEIGHT_TRANSFER_PROFILE=1` records VIME adapter phases; profile runs synchronize
 devices and must be separate from throughput measurements. Gather/publish phases

@@ -2,16 +2,6 @@
 
 This guide provides instructions for installing Vime with NPU support, including the required dependencies and patches.
 
-Sparse HCCL reuses both native #18915 engines, fixed at `f6ad8bd5`, without
-rewriting their transfer methods. Select `delta + sparse_hccl` and inference
-PP=1; training PP remains supported. Seed and deltas use Megatron-Bridge and
-public sparse patches. The first sync sends full int32 coordinates and values;
-there is no dense flag or `send_dense_weight_chunk` in this protocol.
-The sparse path has no VIME direct exporter or Ascend MoE direct writes.
-Use unquantized ND weights, disable EPLB, and keep
-`--update-weight-delta-verify-every 0`. Single checkpoint tensors must contain
-fewer than `2**31` elements. Install both dependency patches together.
-
 ## Component Version Mapping
 
 | Component | Version/Commit | Source |
@@ -24,9 +14,6 @@ fewer than `2**31` elements. Install both dependency patches together.
 | TransformerEngineNPU | `d743c83d060d5edc48867ecb9e93ec80d81860e4` | [GitCode](https://gitcode.com/Ascend/TransformerEngineNPU) |
 | MindSpeed | `fc63de5c48426dd019c3b3f39e65f5bdf56e4086` | [GitCode](https://gitcode.com/Ascend/MindSpeed) |
 | torch_memory_saver (NPU) | `sgl-kernel-npu` tag `2026.6.0` | [GitHub](https://github.com/sgl-project/sgl-kernel-npu) |
-
-Table note: versions above are installation pins, not a claim that a fresh image
-was rebuilt for each runtime measurement.
 
 ## Preparing the Running Environment
 
@@ -68,22 +55,6 @@ git -C /vllm-workspace/vllm apply "${PATCH_DIR}/vllm.patch"
 git -C /vllm-workspace/vllm-ascend apply --check "${PATCH_DIR}/vllm-ascend.patch"
 git -C /vllm-workspace/vllm-ascend apply "${PATCH_DIR}/vllm-ascend.patch"
 ```
-
-`vllm-ascend.patch` carries the Ascend sparse weight-transfer backend from
-vllm-ascend `#18915`: `SparseHCCLTrainerWeightTransferEngine` is the trainer-side
-sender and `SparseHCCLWeightTransferEngine` the inference-side receiver, both
-registered under the `sparse_hccl` backend name. With these patches applied and
-`vime` installed, weights can be synced without a shared filesystem:
-
-```bash
---update-weight-mode delta --update-weight-transport sparse_hccl
-```
-
-The first sync sends complete values with full int32 coordinates through the
-native sparse chunk API; later syncs send changed coordinates and values on the
-same communication group. It requires non-colocated, unquantized rollout weights
-and inference PP=1, PCP=1. See `docs/en/advanced/delta-weight-sync.md` for the knobs and
-the trade-offs against the `disk` transport.
 
 ### 2. Megatron-LM
 

@@ -26,6 +26,10 @@ def create_weight_updater(
 
             update_weight_cls = UpdateWeightFromDiskDelta
         elif update_weight_transport == "sparse_hccl":
+            if quantization_config:
+                raise NotImplementedError("Sparse HCCL requires unquantized rollout weights")
+            if getattr(args, "update_weight_delta_verify_every", 0):
+                raise ValueError("Sparse HCCL requires --update-weight-delta-verify-every 0")
             from .update_weight_from_sparse_hccl import UpdateWeightFromSparseHCCL
 
             update_weight_cls = UpdateWeightFromSparseHCCL

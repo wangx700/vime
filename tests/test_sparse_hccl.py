@@ -116,7 +116,9 @@ def _compare_sparse_with_full_weights(model, cfg_dir, rank):
     assert {record.dtype for record in index} == {torch.bfloat16, torch.float32}
 
     def export():
-        return {name: weight.detach().cpu().clone() for chunk in iterator.get_hf_weight_chunks() for name, weight in chunk}
+        return {
+            name: weight.detach().cpu().clone() for chunk in iterator.get_hf_weight_chunks() for name, weight in chunk
+        }
 
     accumulated = export()
     snapshots = {}
@@ -206,7 +208,9 @@ class _TPShardModel(torch.nn.Module):
     def __init__(self, rank):
         super().__init__()
         self.rank = rank
-        self.weight = torch.nn.Parameter(torch.arange(8, dtype=torch.bfloat16).reshape(4, 2)[rank * 2 : rank * 2 + 2].clone())
+        self.weight = torch.nn.Parameter(
+            torch.arange(8, dtype=torch.bfloat16).reshape(4, 2)[rank * 2 : rank * 2 + 2].clone()
+        )
 
     def load_weights(self, weights):
         for name, weight in dict(weights).items():
@@ -248,7 +252,10 @@ def _run_gather_regression():
     ]
     for dtype in (torch.float32, torch.bfloat16):
         for counts in cases:
-            pieces = [[torch.arange(size, dtype=torch.int32) + r * 100 + slot * 10 for slot, size in enumerate(row)] for r, row in enumerate(counts)]
+            pieces = [
+                [torch.arange(size, dtype=torch.int32) + r * 100 + slot * 10 for slot, size in enumerate(row)]
+                for r, row in enumerate(counts)
+            ]
             indices = torch.cat(pieces[rank]).npu()
             values = torch.cat([piece.float().to(dtype) for piece in pieces[rank]]).npu()
             # Cover noncontiguous caller buffers as well as empty participants.
@@ -280,7 +287,9 @@ def _run_gather_regression():
 
 def _distributed_worker(rank, port, cfg_dir):
     """Initialize one rank and guarantee cleanup for success or failed assertions."""
-    os.environ.update(RANK=str(rank), LOCAL_RANK=str(rank), WORLD_SIZE=str(TP * PP), MASTER_ADDR="127.0.0.1", MASTER_PORT=str(port))
+    os.environ.update(
+        RANK=str(rank), LOCAL_RANK=str(rank), WORLD_SIZE=str(TP * PP), MASTER_ADDR="127.0.0.1", MASTER_PORT=str(port)
+    )
     torch.npu.set_device(rank)
     store = dist.TCPStore("127.0.0.1", port, is_master=False, timeout=timedelta(seconds=120))
     dist.init_process_group("hccl", store=store, rank=rank, world_size=TP * PP, timeout=timedelta(seconds=120))
@@ -320,13 +329,21 @@ def test_nonempty_delta_always_uses_bridge_converter(monkeypatch, batch_size):
     monkeypatch.setattr(mapping, "megatron_to_hf", convert)
     monkeypatch.setattr(megatron_delta_export, "_device_shard", lambda record: local.view(-1))
     record = SimpleNamespace(
-        param=local, probe=mapping, module=None, megatron_name="weight",
-        slots=[("weight", (2, 2))], hf_vocab_size=None,
+        param=local,
+        probe=mapping,
+        module=None,
+        megatron_name="weight",
+        slots=[("weight", (2, 2))],
+        hf_vocab_size=None,
         spec=SimpleNamespace(contributes=True, gather_group=None),
     )
-    entries = list(megatron_delta_export.iter_delta_entries(
-        [record], {"weight": torch.zeros_like(local).view(-1)}, batch_size=batch_size,
-    ))
+    entries = list(
+        megatron_delta_export.iter_delta_entries(
+            [record],
+            {"weight": torch.zeros_like(local).view(-1)},
+            batch_size=batch_size,
+        )
+    )
     assert len(calls) == len(entries) == 1
     assert torch.isnan(calls[0].reshape(-1)[[1, 2]]).all()
     _slots, _dtype, counts, indices, values, _group = entries[0]
@@ -379,7 +396,15 @@ def test_loader_preserves_full_state_across_split_updates(rank):
 def test_bad_wire_bounds_fail_before_mutation():
     model = _TPShardModel(0)
     before = model.weight.detach().clone()
-    patches = [CheckpointWeightPatch(name="weight", shape=(4, 2), dtype=torch.float32, indices=torch.tensor([8], dtype=torch.int32), values=torch.ones(1))]
+    patches = [
+        CheckpointWeightPatch(
+            name="weight",
+            shape=(4, 2),
+            dtype=torch.float32,
+            indices=torch.tensor([8], dtype=torch.int32),
+            values=torch.ones(1),
+        )
+    ]
     with pytest.raises((IndexError, ValueError)):
         load_checkpoint_weight_patches(model, patches)
     assert torch.equal(model.weight, before)
@@ -523,7 +548,7 @@ def test_empty_hccl_peer_does_not_enqueue_p2p(monkeypatch):
 
 
 @pytest.mark.unit
-def test_native_bucket_preserves_checkpoint_coordinates_when_split():
+def test_sparse_bucket_preserves_checkpoint_coordinates_when_split():
     sent = []
     bucket = updater_module._SparseFlushBucket(16, lambda patches: sent.append(list(patches)))
     bucket.add("weight", (2, 3), torch.tensor([0, 2, 3, 5], dtype=torch.int32), torch.tensor([1.0, 2.0, 3.0, 4.0]))
@@ -538,7 +563,7 @@ def test_native_bucket_preserves_checkpoint_coordinates_when_split():
 
 @pytest.mark.unit
 @pytest.mark.parametrize("capacity,expected_flushes", [(16, 4), (64, 1)])
-def test_native_seed_uses_public_sparse_chunks(monkeypatch, capacity, expected_flushes):
+def test_sparse_seed_uses_public_sparse_chunks(monkeypatch, capacity, expected_flushes):
     instance = updater_module.UpdateWeightFromSparseHCCL.__new__(updater_module.UpdateWeightFromSparseHCCL)
     expected = {"weight": torch.arange(6, dtype=torch.float32).reshape(2, 3), "bias": torch.tensor([3.0, 5.0])}
     instance.args = SimpleNamespace(update_weight_buffer_size=capacity)
@@ -568,7 +593,7 @@ def test_native_seed_uses_public_sparse_chunks(monkeypatch, capacity, expected_f
 
 
 @pytest.mark.unit
-def test_native_seed_uses_bridge_on_non_wire_rank(monkeypatch):
+def test_sparse_seed_uses_bridge_on_non_wire_rank(monkeypatch):
     instance = updater_module.UpdateWeightFromSparseHCCL.__new__(updater_module.UpdateWeightFromSparseHCCL)
     instance.args = SimpleNamespace(update_weight_buffer_size=1024)
     calls = []
@@ -581,18 +606,26 @@ def test_native_seed_uses_bridge_on_non_wire_rank(monkeypatch):
     monkeypatch.setattr(updater_module.dist, "get_rank", lambda: 1)
     assert instance._send_seed() == (0, 0)
     assert instance._send_seed() == (0, 0)
-    assert calls == [{"progress_desc": "Native sparse HCCL Bridge seed"}] * 2
+    assert calls == [{"progress_desc": "Sparse HCCL Bridge seed"}] * 2
 
 
 @pytest.mark.unit
-def test_native_receiver_verification_request_is_rejected():
-    with pytest.raises(ValueError, match="does not expose rank-local verify"):
-        updater_module.UpdateWeightFromSparseHCCL(SimpleNamespace(update_weight_delta_verify_every=1), [], lambda: {}, model_name="test", quantization_config=None)
+def test_sparse_receiver_verification_request_is_rejected():
+    from vime.backends.megatron_utils.update_weight import create_weight_updater
+
+    args = SimpleNamespace(
+        update_weight_mode="delta",
+        update_weight_transport="sparse_hccl",
+        colocate=False,
+        update_weight_delta_verify_every=1,
+    )
+    with pytest.raises(ValueError, match="verify-every 0"):
+        create_weight_updater(args, [], lambda: {}, model_name="test", quantization_config=None)
 
 
 @pytest.mark.unit
 @pytest.mark.parametrize("indices,values", [([-1], [1.0]), ([4], [1.0]), ([1, 1], [1.0, 2.0]), ([0], [float("nan")])])
-def test_native_payload_rejected_before_engine_send(monkeypatch, indices, values):
+def test_sparse_payload_rejected_before_engine_send(monkeypatch, indices, values):
     from contextlib import nullcontext
 
     instance = updater_module.UpdateWeightFromSparseHCCL.__new__(updater_module.UpdateWeightFromSparseHCCL)
@@ -601,59 +634,69 @@ def test_native_payload_rejected_before_engine_send(monkeypatch, indices, values
     instance._profile = SimpleNamespace(measure=lambda *a: nullcontext())
     instance._trainer = SimpleNamespace(
         model_update_group=SimpleNamespace(device=torch.device("cpu")),
-        send_weight_chunk=lambda patches: pytest.fail("invalid payload reached native engine"),
+        send_weight_chunk=lambda patches: pytest.fail("invalid payload reached sender"),
     )
     monkeypatch.setattr(updater_module.dist, "get_rank", lambda: 0)
-    patch = updater_module.SparseWeightPatch("weight", torch.tensor(indices, dtype=torch.int32), torch.tensor(values), (4,))
+    patch = updater_module.SparseWeightPatch(
+        "weight", torch.tensor(indices, dtype=torch.int32), torch.tensor(values), (4,)
+    )
     with pytest.raises(ValueError, match="Sparse payload"):
         instance._publish_flush([patch])
     assert not instance._payload_started
 
 
 @pytest.mark.unit
-def test_native_payload_normalizes_noncontiguous_tensors_once_per_chunk(monkeypatch):
-    patches = [updater_module.SparseWeightPatch(
-        name, torch.tensor([0, 99, 3, 99], dtype=torch.int32)[::2], torch.tensor([0.0, 99.0, 7.0, 99.0])[::2], (4,)
-    ) for name in ("first", "second")]
-    original = torch.Tensor.item
+def test_sparse_payload_normalizes_noncontiguous_tensors_once_per_chunk(monkeypatch):
+    patches = [
+        updater_module.SparseWeightPatch(
+            name, torch.tensor([0, 99, 3, 99], dtype=torch.int32)[::2], torch.tensor([0.0, 99.0, 7.0, 99.0])[::2], (4,)
+        )
+        for name in ("first", "second")
+    ]
+    original = torch.Tensor.cpu
     reads = []
 
-    def read(tensor):
+    def read(tensor, *args, **kwargs):
         reads.append(True)
-        return original(tensor)
+        return original(tensor, *args, **kwargs)
 
-    monkeypatch.setattr(torch.Tensor, "item", read)
-    prepared = updater_module.prepare_native_sparse_patches(patches, torch.device("cpu"))
+    monkeypatch.setattr(torch.Tensor, "cpu", read)
+    prepared = updater_module.prepare_sparse_patches(patches, torch.device("cpu"))
     assert len(reads) == 1
     assert all(p.indices.is_contiguous() and p.values.is_contiguous() for p in prepared)
     assert all(p.values.tolist() == [0.0, 7.0] for p in prepared)
 
 
 @pytest.mark.unit
-def test_native_loader_large_shape_limit_is_explicit():
-    patch = updater_module.SparseWeightPatch("large", torch.tensor([0], dtype=torch.int32), torch.tensor([1.0]), (2**31,))
+def test_sparse_loader_large_shape_limit_is_explicit():
+    patch = updater_module.SparseWeightPatch(
+        "large", torch.tensor([0], dtype=torch.int32), torch.tensor([1.0]), (2**31,)
+    )
     with pytest.raises(ValueError, match="smaller than 2\\*\\*31"):
-        updater_module.prepare_native_sparse_patches([patch], torch.device("cpu"))
+        updater_module.prepare_sparse_patches([patch], torch.device("cpu"))
 
 
 @pytest.mark.unit
-def test_native_receiver_pp_rejected_before_bridge_initialization():
-    args = SimpleNamespace(update_weight_delta_verify_every=0, colocate=False, vllm_pipeline_parallel_size=2)
+def test_sparse_receiver_pp_rejected_before_connection():
+    instance = updater_module.UpdateWeightFromSparseHCCL.__new__(updater_module.UpdateWeightFromSparseHCCL)
+    instance.args = SimpleNamespace(vllm_pipeline_parallel_size=2)
     with pytest.raises(ValueError, match="pipeline_parallel_size=1"):
-        updater_module.UpdateWeightFromSparseHCCL(args, [], lambda: {}, model_name="test", quantization_config=None)
+        instance.connect_rollout_engines([], None)
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize("config", [{"pp_size": 2}, {"pipeline_parallel_size": 2}, {"pcp_size": 2}, {"prefill_context_parallel_size": 2}])
-def test_native_external_parallel_config_rejected_before_rendezvous(config):
+@pytest.mark.parametrize(
+    "config", [{"pp_size": 2}, {"pipeline_parallel_size": 2}, {"pcp_size": 2}, {"prefill_context_parallel_size": 2}]
+)
+def test_sparse_external_parallel_config_rejected_before_rendezvous(config):
     instance = updater_module.UpdateWeightFromSparseHCCL.__new__(updater_module.UpdateWeightFromSparseHCCL)
     instance.disconnect_rollout_engines = lambda: pytest.fail("unsupported config reached connection setup")
-    with pytest.raises(ValueError, match="does not support"):
+    with pytest.raises(ValueError, match="requires inference"):
         instance.connect_rollout_engines([], None, engine_parallel_configs=[config])
 
 
 @pytest.mark.unit
-def test_native_sparse_updates_do_not_replay_seed(updater):
+def test_sparse_updates_do_not_replay_seed(updater):
     finishes = []
     updater._send_sparse_delta = lambda: (1, 24, 4)
     updater._send_seed = lambda: pytest.fail("steady updates must not replay seed")
@@ -664,7 +707,9 @@ def test_native_sparse_updates_do_not_replay_seed(updater):
     assert updater._steady_updates == 3
 
 
-@pytest.mark.parametrize("local_nan,remote_nan,seeded", [(False, False, True), (True, False, False), (False, True, True)])
+@pytest.mark.parametrize(
+    "local_nan,remote_nan,seeded", [(False, False, True), (True, False, False), (False, True, True)]
+)
 def test_nan_guard_precedes_payload_and_snapshots(updater, monkeypatch, local_nan, remote_nan, seeded):
     """Exercise the real NaN guard with mocked reduction; fail before seed/delta writes."""
     updater._seeded = seeded
@@ -714,7 +759,9 @@ def test_update_failure_preserves_safe_state(updater, phase):
     updater._send_sparse_delta = send
     updater._ensure_export_index = fail if phase == "prepare" else lambda: None
     updater._recover_before_payload = lambda: recovered.append(True)
-    updater._finish_update = fail if phase == "finish" else lambda: pytest.fail("failed update must not resume generation")
+    updater._finish_update = (
+        fail if phase == "finish" else lambda: pytest.fail("failed update must not resume generation")
+    )
     with pytest.raises(RuntimeError, match=f"{phase} failed"):
         updater.update_weights()
     assert recovered == ([True] if phase == "prepare" else [])
@@ -749,3 +796,32 @@ def test_distributed_sparse_hccl_matches_full(distributed_rendezvous):
             if process.is_alive():
                 process.kill()
                 process.join(timeout=5)
+
+
+@pytest.mark.unit
+def test_sorted_sparse_payload_avoids_sort(monkeypatch):
+    def unexpected_sort(*args, **kwargs):
+        pytest.fail("Ordered indices should not allocate a sorting workspace")
+
+    monkeypatch.setattr(torch, "sort", unexpected_sort)
+    patch = updater_module.SparseWeightPatch(
+        "weight", torch.arange(1024, dtype=torch.int32), torch.zeros(1024), (1024,)
+    )
+    prepared = updater_module.prepare_sparse_patches([patch], torch.device("cpu"))
+    assert prepared[0].indices.data_ptr() == patch.indices.data_ptr()
+    assert torch.equal(prepared[0].values, patch.values)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("indices", [[3, 0, 2], [2, 0, 2]])
+def test_unordered_sparse_payload_keeps_value_pairing_and_rejects_duplicates(indices):
+    patch = updater_module.SparseWeightPatch(
+        "weight", torch.tensor(indices, dtype=torch.int32), torch.tensor([9.0, 0.0, 7.0]), (4,)
+    )
+    if len(set(indices)) != len(indices):
+        with pytest.raises(ValueError, match="duplicate"):
+            updater_module.prepare_sparse_patches([patch], torch.device("cpu"))
+    else:
+        prepared = updater_module.prepare_sparse_patches([patch], torch.device("cpu"))[0]
+        assert torch.equal(prepared.indices, patch.indices)
+        assert torch.equal(prepared.values, patch.values)
