@@ -33,7 +33,6 @@ from typing import Any
 import torch
 
 from .delta_spec import ShardSpec
-from .delta_sync.sparse_gather import shard_delta_indices
 
 logger = logging.getLogger(__name__)
 
@@ -184,14 +183,14 @@ def trim_hf_vocab_padding(name: str, tensor: torch.Tensor, vocab_size: int | Non
     return tensor
 
 
-def build_export_index(bridge, megatron_model, slot_cache: dict | None = None) -> list[McoreParamExport]:
+def build_export_index(bridge, megatron_model) -> list[McoreParamExport]:
     """Enumerate every mcore parameter through the bridge's conversion tasks
     and precompute its probe + wire routing.
 
     No shard geometry is hand-computed here: the comm-stubbed probe emits final
     HF coordinates straight from the local shard, so the engine only needs to
     know WHICH group's entries to merge per parameter (the spec's
-    ``gather_group``; ``full_shape`` is the nominal local shape) and which
+    ``gather_group``) and which
     ranks contribute. The index is built once (parameter sets are static) and
     reused by both the shard export and the delta entry hook.
 
@@ -233,14 +232,13 @@ def build_export_index(bridge, megatron_model, slot_cache: dict | None = None) -
                 McoreParamExport(
                     megatron_name=name,
                     param=None,
-                    spec=ShardSpec(full_shape=(0,), place=0, gather_group=world, contributes=False),
+                    spec=ShardSpec(gather_group=world, contributes=False),
                     probe=None,
                     module=None,
                 )
             )
             continue
         module = task.megatron_module
-        local_shape = tuple(int(x) for x in param.shape)
 
         is_expert = mapping.is_expert and (ep_size > 1 or tp_world > 1)
         is_tp_sharded = getattr(param, "tensor_model_parallel", False) and tp_world > 1
@@ -260,27 +258,23 @@ def build_export_index(bridge, megatron_model, slot_cache: dict | None = None) -
                     mpu.get_tensor_model_parallel_rank() == 0
                     and mpu.get_data_parallel_rank(with_context_parallel=True) == 0
                 )
-            spec = ShardSpec(full_shape=local_shape, place=0, gather_group=world, contributes=contributes)
+            spec = ShardSpec(gather_group=world, contributes=contributes)
         elif is_expert:
             # every rank holding a piece of this expert set contributes; the
             # engine merges their probe entries over the joint etp x ep group.
             spec = ShardSpec(
-                full_shape=local_shape,
-                place=0,
                 gather_group=mpu.get_expert_tensor_and_model_parallel_group(),
                 contributes=mpu.get_expert_data_parallel_rank() == 0,
             )
         elif is_tp_sharded:
             spec = ShardSpec(
-                full_shape=local_shape,
-                place=0,
                 gather_group=tp_group,
                 contributes=mpu.get_data_parallel_rank(with_context_parallel=True) == 0,
             )
         else:
             # replicated: engine's pg=None path (rank 0 consumes its own entry
             # directly, replicas stay in lockstep via zero counts).
-            spec = ShardSpec(full_shape=local_shape, contributes=torch.distributed.get_rank() == 0)
+            spec = ShardSpec(contributes=torch.distributed.get_rank() == 0)
 
         index.append(
             McoreParamExport(
@@ -293,7 +287,7 @@ def build_export_index(bridge, megatron_model, slot_cache: dict | None = None) -
             )
         )
 
-    _exchange_slot_tables(index, slot_cache)
+    _exchange_slot_tables(index)
     # a row with an empty union has no owner on ANY rank: the bridge skipped
     # it everywhere (no mapping / missing HF key), so it is outside the
     # bridge's own export scope -- exactly what PP=1 does by skipping
@@ -311,7 +305,7 @@ def build_export_index(bridge, megatron_model, slot_cache: dict | None = None) -
     return index
 
 
-def _exchange_slot_tables(index: list[McoreParamExport], slot_cache: dict) -> None:
+def _exchange_slot_tables(index: list[McoreParamExport]) -> None:
     """One-time GLOBAL slot-table exchange, run at every world size, keyed by
     DIRECTORY ROW (not by param name).
 
@@ -333,11 +327,12 @@ def _exchange_slot_tables(index: list[McoreParamExport], slot_cache: dict) -> No
         if rec.param is None:
             local_rows.append(None)
             continue
-        if rec.megatron_name not in slot_cache:
+        if rec.slots is None:
             empty_idx = torch.empty(0, dtype=torch.int64, device=rec.param.device)
             empty_val = torch.empty(0, dtype=rec.param.dtype, device=rec.param.device)
-            mcore_hf_delta_entry(rec, 0, empty_idx, empty_val, slot_cache)
-        local_rows.append((slot_cache[rec.megatron_name], rec.param.dtype))
+            slots, *_ = mcore_hf_delta_entry(rec, empty_idx, empty_val)
+            rec.slots = slots
+        local_rows.append((rec.slots, rec.param.dtype))
 
     world = torch.distributed.get_world_size()
     gathered: list = [None] * world
@@ -366,10 +361,8 @@ def _exchange_slot_tables(index: list[McoreParamExport], slot_cache: dict) -> No
 
 def mcore_hf_delta_entry(
     rec: McoreParamExport,
-    _place,
     lidx: torch.Tensor,
     lval: torch.Tensor,
-    slot_cache: dict,
 ):
     """Probe one mcore param's shard-local delta into its final HF-coordinate
     entry ``(slots, dtype_str, counts, hf_idx, hf_val)``.
@@ -386,7 +379,7 @@ def mcore_hf_delta_entry(
         lval.numel() == 0 or lval.is_floating_point()
     ), f"{rec.megatron_name}: NaN sentinels require a floating-point param, got {lval.dtype}"
 
-    cached = rec.slots if rec.slots is not None else slot_cache.get(rec.megatron_name)
+    cached = rec.slots
     if rec.param is None:
         # owned by another pipeline stage: pure lockstep row. The slot table
         # was pre-seeded from the owner stage (fail loud if not -- an
@@ -415,13 +408,12 @@ def mcore_hf_delta_entry(
     }
 
     key = rec.megatron_name
-    slots = rec.slots if rec.slots is not None else slot_cache.get(key)
+    slots = rec.slots
     if slots is None:
         # only reachable from the index-build exchange itself, which probes a
         # zero delta to reveal this rank's local list before the row unions
         # are installed on the recs; steady entries always find rec.slots.
         slots = [(n, tuple(int(x) for x in t.shape)) for n, t in outs.items()]
-        slot_cache[key] = slots
     unknown = set(outs) - {n for n, _ in slots}
     assert not unknown, (
         f"{key}: probe emitted slots missing from the global table {sorted(unknown)[:4]} -- "
@@ -526,60 +518,8 @@ class _SnapshotRefreshQueue:
         self.nbytes = 0
 
 
-def _iter_delta_entries_unbatched(index, snapshots):
-    """The verl hf_delta_export contract, with explicit Megatron placement."""
-    # CPU snapshots are required when a large training shard cannot retain a
-    # second model-sized copy on the accelerator.  Reuse one accelerator
-    # staging allocation per dtype/device instead of allocating a new Tensor
-    # for every parameter via snapshot.to(device).  Pinned snapshots make the
-    # copy asynchronous; current-stream ordering keeps it complete before the
-    # NPU comparison below and before the buffer is reused by the next row.
-    staging: dict[tuple[torch.device, torch.dtype], torch.Tensor] = {}
-    refresh = _SnapshotRefreshQueue()
-    for record in index:
-        if record.param is None:
-            device = torch.accelerator.current_device_index()
-            local_indices = torch.empty(0, dtype=torch.int64, device=device)
-            local_values = torch.empty(0, dtype=record.dtype, device=device)
-        else:
-            local = _device_shard(record)
-            if record.spec.contributes:
-                snapshot = snapshots.get(record.megatron_name)
-                if snapshot is None or snapshot.shape != local.shape or snapshot.dtype != local.dtype:
-                    raise RuntimeError(f"{record.megatron_name}: no matching seed snapshot for this shard")
-                if snapshot.device == local.device:
-                    base = snapshot
-                else:
-                    key = (local.device, local.dtype)
-                    buffer = staging.get(key)
-                    if buffer is None or buffer.numel() < local.numel():
-                        buffer = torch.empty_like(local)
-                        staging[key] = buffer
-                    base = buffer[: local.numel()]
-                    base.copy_(snapshot, non_blocking=True)
-                local_indices, local_values = shard_delta_indices(local, base, 0)
-                if snapshot.device == local.device:
-                    snapshot.copy_(local, non_blocking=True)
-                elif local_indices.numel():
-                    # Preserve the next baseline from the sparse result itself.
-                    # Copying only changed positions avoids a full model-shard
-                    # D2H transfer after every steady-state diff.
-                    refresh.add(snapshot, local_indices, local_values)
-            else:
-                local_indices = torch.empty(0, dtype=torch.int64, device=local.device)
-                local_values = torch.empty(0, dtype=local.dtype, device=local.device)
-        yield (
-            *mcore_hf_delta_entry(record, 0, local_indices, local_values, {}),
-            record.spec.gather_group,
-        )
-    refresh.flush()
-
-
 def iter_delta_entries(index, snapshots, *, batch_size=32):
     """Batch dynamic diff extraction, preserving verl's record/slot ordering."""
-    if batch_size <= 1:
-        yield from _iter_delta_entries_unbatched(index, snapshots)
-        return
     from .delta_sync.sparse_gather import compact_shard_masks, shard_delta_mask
 
     max_mask_bytes = 32 << 20
@@ -604,7 +544,7 @@ def iter_delta_entries(index, snapshots, *, batch_size=32):
                 indices = torch.empty(0, dtype=torch.int64, device=device)
                 values = torch.empty(0, dtype=dtype, device=device)
             yield (
-                *mcore_hf_delta_entry(record, 0, indices, values, {}),
+                *mcore_hf_delta_entry(record, indices, values),
                 record.spec.gather_group,
             )
         pending.clear()

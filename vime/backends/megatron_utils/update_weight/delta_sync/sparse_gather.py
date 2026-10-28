@@ -27,26 +27,11 @@ class GatherWorkspace:
 
 
 def shard_delta_mask(local_new, local_snap):
-    """The same bit comparison as verl, separated for batch profiling."""
+    """The same bit comparison as verl, used by batched extraction."""
     int_dtype = _DTYPE_INT.get(local_new.element_size())
     if int_dtype is None:
         raise ValueError(f"unsupported element size {local_new.element_size()}")
     return local_new.view(int_dtype) != local_snap.view(int_dtype)
-
-
-def shard_delta_indices(
-    local_new: torch.Tensor,
-    local_snap: torch.Tensor,
-    offset: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Bit-exact local shard diff returning flattened positions and values."""
-    int_dtype = _DTYPE_INT.get(local_new.element_size())
-    if int_dtype is None:
-        raise ValueError(f"unsupported element size {local_new.element_size()}")
-    mask = local_new.view(int_dtype) != local_snap.view(int_dtype)
-    local_idx = mask.nonzero(as_tuple=False).view(-1)
-    values = local_new[local_idx]
-    return local_idx.to(torch.int64) + offset, values
 
 
 def gather_slot_entries_to_rank0(
@@ -199,7 +184,7 @@ def gather_slot_entries_to_rank0(
     return result
 
 
-def compact_shard_masks(locals_, masks, *, with_midpoints=False):
+def compact_shard_masks(locals_, masks):
     """One ordered nonzero per bounded batch, matching per-shard bit diffs.
 
     Masks remain bitwise comparisons, as in verl. Only the variable-length
@@ -208,18 +193,17 @@ def compact_shard_masks(locals_, masks, *, with_midpoints=False):
     """
     if not locals_:
         return []
-    ends, midpoints, total = [], [], 0
+    ends, total = [], 0
     for local in locals_:
-        midpoints.append(total + local.numel() // 2)
         total += local.numel()
         ends.append(total)
     positions = torch.cat(masks).nonzero(as_tuple=False).view(-1)
-    boundaries = torch.tensor(ends + midpoints if with_midpoints else ends, dtype=torch.int64, device=positions.device)
+    boundaries = torch.tensor(ends, dtype=torch.int64, device=positions.device)
     splits = torch.searchsorted(positions, boundaries).cpu().tolist()
     result, start, base = [], 0, 0
-    for slot, (local, end, boundary) in enumerate(zip(locals_, splits[: len(ends)], ends, strict=True)):
+    for local, end, boundary in zip(locals_, splits, ends, strict=True):
         indices = positions[start:end] - base
         row = (indices, local.index_select(0, indices))
-        result.append((*row, splits[len(ends) + slot] - start) if with_midpoints else row)
+        result.append(row)
         start, base = end, boundary
     return result

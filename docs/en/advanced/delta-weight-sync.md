@@ -19,14 +19,12 @@ Sparse HCCL:
 --update-weight-mode delta
 --update-weight-transport sparse_hccl
 --update-weight-delta-batch-gather 32
---update-weight-delta-verify-every 0
 ```
 
 This path requires non-colocated, unquantized ND rollout weights and inference
 PP=1, with EPLB disabled. Configure `--vllm-pipeline-parallel-size 1`.
 The receiver handles TP/DP/EP loading; inference PP>1 is rejected before
 communication initialization. Training-side PP/TP/EP export remains supported.
-Keep `verify-every` at zero because the receiver has no rank-local verifier.
 
 The script `scripts/run-qwen3-30B-A3B-sparse-hccl.sh` uses training
 TP2/PP2/EP2 and rollout TP2/PP1/EP2, on four training plus two rollout NPUs.
@@ -104,19 +102,12 @@ python tests/test_qwen3_30B_A3B_sparse_hccl_npu.py
 ```
 
 Use a fresh result directory with room for a full BF16 checkpoint (about 61 GB).
-Artifacts include `baseline.json`, `sync-metrics.json`, `sparse-inference.json`,
+Artifacts include `baseline.json`, `sparse-inference.json`,
 `checkpoint-inference.json`, and `comparison.json`. The latter records exact
 matching and maximum absolute logprob error; an exact pass requires zero error.
 A one-prompt match covers that prompt, not all possible model inputs.
 
-Each sync also reports `perf/update_weights_sparse_hccl_prepare_time`,
-`perf/update_weights_sparse_hccl_send_apply_time` and
-`perf/update_weights_sparse_hccl_main_time` in seconds. Prepare time is the
-seed/delta main flow excluding synchronous `send_weight_chunk()` calls;
-send/apply time includes the receive RPC completion. These two intervals sum
-to main time. With multiple flushes, preparation can occur between sends.
-Index construction, validation before the main flow, seed snapshot capture,
-and update begin/finish remain outside this sum and inside the outer Timer.
+The sparse updater does not collect per-phase timing or transfer metrics.
 
 ### Measured unpacked baseline
 
@@ -140,9 +131,7 @@ and 35.10 s: sparse saves approximately 33.2% wall time against unpacked full.
 These runs did not compare generated-token logprobs with a fresh checkpoint load;
 that is the stricter acceptance check added by the script above.
 
-`VLLM_WEIGHT_TRANSFER_PROFILE=1` records VIME adapter phases; profile runs synchronize
-devices and must be separate from throughput measurements. Gather/publish phases
-include nested work and waits, so do not add overlapping durations. Updates are
+Updates are
 in-place and nontransactional; a possibly partial failure prevents updater reuse
 until reconnection and full seeding. Keep generation paused after such a failure.
 

@@ -115,7 +115,6 @@ def execute():
         "--update-weight-transport sparse_hccl "
         "--update-weight-delta-batch-diff 32 "
         "--update-weight-delta-batch-gather 32 "
-        "--update-weight-delta-verify-every 0 "
     )
 
     model_args = (
@@ -202,7 +201,7 @@ def _infer(url, prompt_ids, sampling_params):
     logprobs = [float(row["logprob"]) for row in rows]
     if not all(math.isfinite(value) for value in logprobs):
         raise AssertionError("Non-finite generated-token logprob")
-    return {"token_ids": tokens, "logprobs": logprobs, "finish_reason": choice["finish_reason"], "response": body}
+    return {"token_ids": tokens, "logprobs": logprobs, "finish_reason": choice["finish_reason"]}
 
 
 def _compare(actual, expected):
@@ -236,17 +235,22 @@ def run_e2e(args):
 
     class OracleTrainActor(MegatronTrainRayActor):
         def update_weights(self):
-            started = time.perf_counter()
-            super().update_weights()
-            if dist.get_rank() == 0:
-                record = {
-                    "version": self.weight_updater.weight_version,
-                    "update_seconds": time.perf_counter() - started,
-                    **self.weight_updater.update_weight_metrics,
-                }
-                if not hasattr(self, "sync_records"):
-                    self.sync_records = []
-                self.sync_records.append(record)
+            updater = self.weight_updater
+            publish = updater._publish_flush
+            updates = 0
+
+            def observe(patches):
+                nonlocal updates
+                publish(patches)
+                updates += sum(patch.indices.numel() for patch in patches)
+
+            updater._publish_flush = observe
+            try:
+                super().update_weights()
+            finally:
+                updater._publish_flush = publish
+            if dist.get_rank() == 0 and updates == 0:
+                raise AssertionError("Expected a nonempty weight update")
 
         def export_checkpoint(self, directory):
             # Full Bridge export from the frozen training model, independent of
@@ -277,7 +281,7 @@ def run_e2e(args):
                 except Exception as exc:
                     error = repr(exc)
             _raise_if_rank_zero_failed("finalize comparison checkpoint", error)
-            return self.sync_records if root else None
+            return self.weight_updater.weight_version if root else None
 
     if args.use_critic or args.offload_train or args.offload_rollout or args.release_train:
         raise ValueError("This comparison requires a resident actor and one resident rollout engine")
@@ -332,18 +336,16 @@ def run_e2e(args):
             raise AssertionError("The comparison requires exactly one rollout engine")
         url = ray.get(engines[0].get_url.remote())
         version = ray.get(engines[0].get_weight_version.remote())
-        records = ray.get([worker.export_checkpoint.remote(str(checkpoint)) for worker in actor._actor_handlers])[0]
-        if len(records) < 2 or any(record["perf/update_weights_sparse_hccl_updates"] <= 0 for record in records[1:]):
-            raise AssertionError("The comparison requires a seed and nonempty training deltas")
-        if str(version) != str(records[-1]["version"]):
+        export_version = ray.get(
+            [worker.export_checkpoint.remote(str(checkpoint)) for worker in actor._actor_handlers]
+        )[0]
+        if str(version) != str(export_version):
             raise AssertionError("Inference weight version does not match the exported training model")
-        _write_json(output / "sync-metrics.json", records)
         ray.get(engines[0].flush_cache.remote())
         actual = _infer(url, prompt_ids, sampling)
         _write_json(output / "sparse-inference.json", actual)
         ray.get(engines[0].flush_cache.remote())
         repeat = _infer(url, prompt_ids, sampling)
-        _write_json(output / "sparse-repeat.json", repeat)
         if not _compare(actual, repeat)["passed"]:
             raise AssertionError("Sparse inference is not exactly repeatable on the baseline prompt")
         ray.get(manager.dispose.remote())
@@ -367,9 +369,6 @@ def run_e2e(args):
             "regular",
             None,
             base_gpu_id=pgs["rollout"][2][0],
-        )
-        _write_json(
-            output / "reference-engine.json", {key: value for key, value in kwargs.items() if not key.startswith("_")}
         )
         process = launch_server_process(kwargs)
         expected = _infer(f"http://127.0.0.1:{port}", prompt_ids, sampling)

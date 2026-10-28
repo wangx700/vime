@@ -92,26 +92,20 @@ def test_transport_options_are_registered_once(transport):
             "1",
             "--update-weight-transport",
             transport,
-            "--update-weight-delta-verify-every",
-            "1",
         ]
     )
     assert args.update_weight_transport == transport
-    assert args.update_weight_delta_verify_every == 1
     assert args.update_weight_delta_batch_diff == 32
     assert args.update_weight_delta_batch_gather == 32
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize(
-    "quantization,verify,error", [({"quant_method": "test"}, 0, NotImplementedError), (None, 1, ValueError)]
-)
-def test_sparse_options_rejected_before_import(quantization, verify, error):
+@pytest.mark.parametrize("quantization,error", [({"quant_method": "test"}, NotImplementedError)])
+def test_sparse_options_rejected_before_import(quantization, error):
     args = Namespace(
         update_weight_mode="delta",
         update_weight_transport="sparse_hccl",
         colocate=False,
-        update_weight_delta_verify_every=verify,
     )
     with pytest.raises(error):
         create_weight_updater(args, [], lambda: {}, model_name="test", quantization_config=quantization)

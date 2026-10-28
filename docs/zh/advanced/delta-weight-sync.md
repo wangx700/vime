@@ -14,13 +14,11 @@ Sparse HCCL：
 --update-weight-mode delta
 --update-weight-transport sparse_hccl
 --update-weight-delta-batch-gather 32
---update-weight-delta-verify-every 0
 ```
 
 该路径要求非 colocate、未量化 ND rollout 权重、关闭 EPLB，以及推理 PP=1；
 设置 `--vllm-pipeline-parallel-size 1`。接收端支持 TP/DP/EP，推理 PP>1
 在建组前明确拒绝。训练侧 PP/TP/EP 导出与 gather 保留。
-`verify-every` 必须为零，接收端不提供 rank-local 校验接口。
 
 脚本 `scripts/run-qwen3-30B-A3B-sparse-hccl.sh` 使用训练 TP2/PP2/EP2、
 推理 TP2/PP1/EP2，四张训练卡加两张推理卡。设置 `DATA_ROOT` 指向包含
@@ -88,16 +86,11 @@ python tests/test_qwen3_30B_A3B_sparse_hccl_npu.py
 ```
 
 结果目录必须是新目录，预留约 61 GB 保存完整 BF16 权重。产物包括 `baseline.json`、
-`sync-metrics.json`、`sparse-inference.json`、`checkpoint-inference.json` 和
+`sparse-inference.json`、`checkpoint-inference.json` 和
 `comparison.json`。对比文件包含逐项相等判定和最大 logprob 绝对误差，严格通过要求误差
 为零。单个基线 prompt 的一致性结论仅覆盖该输入。
 
-每次同步还输出 `perf/update_weights_sparse_hccl_prepare_time`、
-`perf/update_weights_sparse_hccl_send_apply_time` 和
-`perf/update_weights_sparse_hccl_main_time`，单位均为秒。
-prepare 是 seed/delta 主流程中同步 `send_weight_chunk()` 调用之外的时间，send/apply
-包含等待推理接收 RPC 完成，两者相加等于 main。多次 flush 时，准备可能穿插在发送之间。
-索引建立、主流程前校验、seed 快照以及 begin/finish 在这个和式之外，但属于外层 Timer。
+Sparse updater 不再采集分段耗时或传输统计。
 
 ### 当前 unpacked 实测基线
 
@@ -117,8 +110,6 @@ Full 每轮全量发送；Sparse 比例为标量更新事件数除以 seed 的 3
 稳态均值分别为 52.57 秒与 35.10 秒，Sparse 相对 unpacked Full 节省约 33.2%。
 这些历史作业未与全新 checkpoint 加载逐 token 对比 logprobs；上面的脚本新增了该严格验收。
 
-`VLLM_WEIGHT_TRANSFER_PROFILE=1` 记录 VIME 适配层阶段。profiling 会同步设备，
-应与吞吐测量分开。gather/publish 含嵌套工作和等待，重叠阶段不能相加。
 更新原地执行、不具备事务回滚；发生可能部分写入的失败后保持暂停，
 updater 不得继续复用，必须重连并重新全量 seed。
 

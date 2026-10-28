@@ -44,11 +44,12 @@ from vllm.model_executor.model_loader.checkpoint_weight_patch import (
 import vime.backends.megatron_utils  # noqa: F401 - Bootstrap NPU before importing Megatron.
 from vime.backends.megatron_utils.update_weight import megatron_delta_export
 from vime.backends.megatron_utils.update_weight import update_weight_from_sparse_hccl as updater_module
-from vime.backends.megatron_utils.update_weight.delta_sync import shard_delta_indices
 from vime.backends.megatron_utils.update_weight.delta_sync import sparse_gather as gather_module
 from vime.backends.megatron_utils.update_weight.delta_sync.sparse_gather import (
     GatherWorkspace,
+    compact_shard_masks,
     gather_slot_entries_to_rank0,
+    shard_delta_mask,
 )
 from vime.backends.megatron_utils.update_weight.megatron_delta_export import _device_shard
 
@@ -104,7 +105,7 @@ def _compare_sparse_with_full_weights(model, cfg_dir, rank):
 
     iterator = HfWeightIteratorBridge(SimpleNamespace(hf_checkpoint=cfg_dir, update_weight_buffer_size=4096), model)
     with iterator.model_context():
-        index = build_export_index(iterator.bridge, model, {})
+        index = build_export_index(iterator.bridge, model)
     assert all(record.param is None or record.param.device.type == "npu" for record in index)
 
     # Exercise PP placeholders with FP32 owner rows alongside BF16 matrices.
@@ -112,7 +113,7 @@ def _compare_sparse_with_full_weights(model, cfg_dir, rank):
         if record.param is not None and record.param.ndim == 1:
             record.param.data = record.param.data.float()
     with iterator.model_context():
-        index = build_export_index(iterator.bridge, model, {})
+        index = build_export_index(iterator.bridge, model)
     assert {record.dtype for record in index} == {torch.bfloat16, torch.float32}
 
     def export():
@@ -221,11 +222,11 @@ class _TPShardModel(torch.nn.Module):
 @pytest.fixture
 def updater(monkeypatch):
     instance = updater_module.UpdateWeightFromSparseHCCL.__new__(updater_module.UpdateWeightFromSparseHCCL)
-    instance.args = SimpleNamespace(update_weight_delta_verify_every=0)
+    instance.args = SimpleNamespace()
     instance._client = object()
     instance._failed = False
     instance._seeded = True
-    instance._steady_updates = 0
+    instance._needs_reconnect = False
     instance.weight_version = 1
     instance._begin_update = lambda: None
     instance._ensure_export_index = lambda: None
@@ -425,9 +426,9 @@ def test_pp_placeholders_share_owner_dtype(monkeypatch):
         )
         if conflicting:
             with pytest.raises(ValueError, match="inconsistent owner dtypes"):
-                megatron_delta_export._exchange_slot_tables([record], {})
+                megatron_delta_export._exchange_slot_tables([record])
             continue
-        megatron_delta_export._exchange_slot_tables([record], {})
+        megatron_delta_export._exchange_slot_tables([record])
         assert record.dtype == torch.float32 and record.slots == slots
         for batch_size in (1, 32):
             entries = list(megatron_delta_export.iter_delta_entries([record], {}, batch_size=batch_size))
@@ -438,20 +439,20 @@ def test_pp_placeholders_share_owner_dtype(monkeypatch):
 
 @pytest.mark.unit
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
-def test_shard_delta_indices_is_bit_exact(dtype):
-    """Preserve BF16/FP32 changed bits and offsets; unchanged shards must emit no payload."""
+def test_compact_shard_masks_is_bit_exact(dtype):
+    """Preserve BF16/FP32 changed bits; unchanged shards must emit no payload."""
     torch.manual_seed(0)
     previous = torch.randn(1000, dtype=dtype)
     current = previous.clone()
     changed = torch.tensor([3, 17, 500, 999], dtype=torch.int64)
     current[changed] += 0.5
 
-    indices, values = shard_delta_indices(current, previous, offset=4096)
+    indices, values = compact_shard_masks([current], [shard_delta_mask(current, previous)])[0]
 
-    assert torch.equal(indices, changed + 4096)
+    assert torch.equal(indices, changed)
     integer_dtype = torch.int16 if dtype == torch.bfloat16 else torch.int32
     assert torch.equal(values.view(integer_dtype), current[changed].view(integer_dtype))
-    indices, values = shard_delta_indices(current.clone(), current, offset=4096)
+    indices, values = compact_shard_masks([current.clone()], [shard_delta_mask(current, current)])[0]
     assert indices.numel() == values.numel() == 0
 
 
@@ -558,25 +559,21 @@ def test_sparse_seed_uses_public_sparse_chunks(monkeypatch, capacity, expected_f
     instance.args = SimpleNamespace(update_weight_buffer_size=capacity)
     chunks = [[item] for item in expected.items()] if capacity == 16 else [list(expected.items())]
     instance._iterator = SimpleNamespace(get_hf_weight_chunks=lambda *a, **kw: iter(chunks))
-    instance.weights_getter = lambda: {}
     instance._client = object()
     sent = []
-    from contextlib import nullcontext
-
     instance._trainer = SimpleNamespace(
         model_update_group=SimpleNamespace(device=torch.device("cpu")),
         send_weight_chunk=lambda patches: sent.append(list(patches)),
     )
-    instance._profile = SimpleNamespace(measure=lambda *a: nullcontext())
     instance._payload_started = False
     monkeypatch.setattr(updater_module.dist, "get_rank", lambda: 0)
-    flushes, wire = instance._send_seed()
+    assert instance._send_seed() is None
     actual = {name: torch.zeros_like(tensor).flatten() for name, tensor in expected.items()}
     for chunk in sent:
         for patch in chunk:
             assert patch.full_shape == tuple(expected[patch.name].shape)
             actual[patch.name].index_copy_(0, patch.indices.long(), patch.values)
-    assert flushes == len(sent) == expected_flushes and wire == 8 * (4 + 4)
+    assert len(sent) == expected_flushes
     assert instance._payload_started
     assert all(torch.equal(actual[name], tensor.flatten()) for name, tensor in expected.items())
 
@@ -593,34 +590,17 @@ def test_sparse_seed_uses_bridge_on_non_wire_rank(monkeypatch):
 
     instance._iterator = SimpleNamespace(get_hf_weight_chunks=export)
     monkeypatch.setattr(updater_module.dist, "get_rank", lambda: 1)
-    assert instance._send_seed() == (0, 0)
-    assert instance._send_seed() == (0, 0)
-    assert calls == [{"progress_desc": "Sparse HCCL Bridge seed"}] * 2
-
-
-@pytest.mark.unit
-def test_sparse_receiver_verification_request_is_rejected():
-    from vime.backends.megatron_utils.update_weight import create_weight_updater
-
-    args = SimpleNamespace(
-        update_weight_mode="delta",
-        update_weight_transport="sparse_hccl",
-        colocate=False,
-        update_weight_delta_verify_every=1,
-    )
-    with pytest.raises(ValueError, match="verify-every 0"):
-        create_weight_updater(args, [], lambda: {}, model_name="test", quantization_config=None)
+    assert instance._send_seed() is None
+    assert instance._send_seed() is None
+    assert calls == [{}, {}]
 
 
 @pytest.mark.unit
 @pytest.mark.parametrize("indices,values", [([-1], [1.0]), ([4], [1.0]), ([1, 1], [1.0, 2.0]), ([0], [float("nan")])])
 def test_sparse_payload_rejected_before_engine_send(monkeypatch, indices, values):
-    from contextlib import nullcontext
-
     instance = updater_module.UpdateWeightFromSparseHCCL.__new__(updater_module.UpdateWeightFromSparseHCCL)
     instance._client = object()
     instance._payload_started = False
-    instance._profile = SimpleNamespace(measure=lambda *a: nullcontext())
     instance._trainer = SimpleNamespace(
         model_update_group=SimpleNamespace(device=torch.device("cpu")),
         send_weight_chunk=lambda patches: pytest.fail("invalid payload reached sender"),
@@ -687,13 +667,12 @@ def test_sparse_external_parallel_config_rejected_before_rendezvous(config):
 @pytest.mark.unit
 def test_sparse_updates_do_not_replay_seed(updater):
     finishes = []
-    updater._send_sparse_delta = lambda: (1, 24, 4)
+    updater._send_sparse_delta = lambda: None
     updater._send_seed = lambda: pytest.fail("steady updates must not replay seed")
     updater._finish_update = lambda: finishes.append(updater.weight_version)
     for _ in range(3):
         updater.update_weights()
     assert finishes == [2, 3, 4]
-    assert updater._steady_updates == 3
 
 
 @pytest.mark.parametrize(
@@ -723,7 +702,7 @@ def test_nan_guard_precedes_payload_and_snapshots(updater, monkeypatch, local_na
             updater.update_weights()
         assert recovered == [True] and not updater._payload_started
     else:
-        updater._send_sparse_delta = lambda **kwargs: (1, 24, 4)
+        updater._send_sparse_delta = lambda **kwargs: None
         updater._finish_update = lambda: None
         updater.update_weights()
         assert not recovered
@@ -743,7 +722,7 @@ def test_update_failure_preserves_safe_state(updater, phase):
         if phase == "payload":
             updater._payload_started = True
             fail()
-        return (1, 24, 4)
+        return None
 
     updater._send_sparse_delta = send
     updater._ensure_export_index = fail if phase == "prepare" else lambda: None

@@ -575,15 +575,6 @@ def get_vime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
-                "--update-weight-delta-verify-every",
-                type=int,
-                default=0,
-                help=(
-                    "Reserved for sparse receiver verification extensions. "
-                    "sparse_hccl requires zero; use the dedicated correctness E2E oracle."
-                ),
-            )
-            parser.add_argument(
                 "--keep-old-actor",
                 action="store_true",
                 help="Whether to keep the rollout model on training process",
@@ -2245,5 +2236,3 @@ def vime_validate_args(args):
             raise ValueError("--update-weight-delta-batch-diff must be at least 1.")
         if args.update_weight_delta_batch_gather < 1:
             raise ValueError("--update-weight-delta-batch-gather must be at least 1.")
-        if args.update_weight_delta_verify_every < 0:
-            raise ValueError("--update-weight-delta-verify-every cannot be negative.")

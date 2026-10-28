@@ -16,7 +16,5 @@ if TYPE_CHECKING:
 
 @dataclass
 class ShardSpec:
-    full_shape: tuple[int, ...]
-    place: int = 0
     gather_group: ProcessGroup | None = None
     contributes: bool = True

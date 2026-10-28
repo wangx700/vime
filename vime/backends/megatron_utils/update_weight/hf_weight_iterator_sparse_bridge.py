@@ -59,8 +59,7 @@ class HfWeightIteratorSparseBridge:
             for config in added:
                 del config.share_embeddings_and_output_weights
 
-    def get_hf_weight_chunks(self, _weights=None, progress_desc="Bridge weight export"):
-        del progress_desc
+    def get_hf_weight_chunks(self):
         with self.model_context():
             chunk, nbytes = [], 0
             for exported in self.bridge.export_hf_weights(self.model, cpu=False, show_progress=False):
