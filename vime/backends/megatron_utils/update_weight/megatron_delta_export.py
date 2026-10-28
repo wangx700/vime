@@ -28,13 +28,16 @@ from __future__ import annotations
 import copy
 import logging
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 
-from .delta_spec import ShardSpec
+if TYPE_CHECKING:
+    from torch.distributed import ProcessGroup
 
 logger = logging.getLogger(__name__)
+
+_DTYPE_INT = {1: torch.uint8, 2: torch.int16, 4: torch.int32, 8: torch.int64}
 
 
 class _ProbeGroup:
@@ -160,9 +163,10 @@ class McoreParamExport:
 
     megatron_name: str
     param: torch.Tensor | None
-    spec: ShardSpec
     probe: Any
     module: Any  # module handle megatron_to_hf reads config from
+    gather_group: ProcessGroup | None = None
+    contributes: bool = True
     # GLOBAL slot table for this directory row (set by the index-build
     # exchange): identical on every rank of the row's merge group.
     slots: list | None = None
@@ -189,7 +193,7 @@ def build_export_index(bridge, megatron_model) -> list[McoreParamExport]:
 
     No shard geometry is hand-computed here: the comm-stubbed probe emits final
     HF coordinates straight from the local shard, so the engine only needs to
-    know WHICH group's entries to merge per parameter (the spec's
+    know WHICH group's entries to merge per parameter (the record's
     ``gather_group``) and which
     ranks contribute. The index is built once (parameter sets are static) and
     reused by both the shard export and the delta entry hook.
@@ -232,7 +236,8 @@ def build_export_index(bridge, megatron_model) -> list[McoreParamExport]:
                 McoreParamExport(
                     megatron_name=name,
                     param=None,
-                    spec=ShardSpec(gather_group=world, contributes=False),
+                    gather_group=world,
+                    contributes=False,
                     probe=None,
                     module=None,
                 )
@@ -258,29 +263,27 @@ def build_export_index(bridge, megatron_model) -> list[McoreParamExport]:
                     mpu.get_tensor_model_parallel_rank() == 0
                     and mpu.get_data_parallel_rank(with_context_parallel=True) == 0
                 )
-            spec = ShardSpec(gather_group=world, contributes=contributes)
+            gather_group = world
         elif is_expert:
             # every rank holding a piece of this expert set contributes; the
             # engine merges their probe entries over the joint etp x ep group.
-            spec = ShardSpec(
-                gather_group=mpu.get_expert_tensor_and_model_parallel_group(),
-                contributes=mpu.get_expert_data_parallel_rank() == 0,
-            )
+            gather_group = mpu.get_expert_tensor_and_model_parallel_group()
+            contributes = mpu.get_expert_data_parallel_rank() == 0
         elif is_tp_sharded:
-            spec = ShardSpec(
-                gather_group=tp_group,
-                contributes=mpu.get_data_parallel_rank(with_context_parallel=True) == 0,
-            )
+            gather_group = tp_group
+            contributes = mpu.get_data_parallel_rank(with_context_parallel=True) == 0
         else:
             # replicated: engine's pg=None path (rank 0 consumes its own entry
             # directly, replicas stay in lockstep via zero counts).
-            spec = ShardSpec(contributes=torch.distributed.get_rank() == 0)
+            gather_group = None
+            contributes = torch.distributed.get_rank() == 0
 
         index.append(
             McoreParamExport(
                 megatron_name=name,
                 param=param,
-                spec=spec,
+                gather_group=gather_group,
+                contributes=contributes,
                 probe=make_probe(mapping, module, nan_pool),
                 module=module,
                 hf_vocab_size=hf_vocab_size,
@@ -454,7 +457,7 @@ def _device_shard(record: McoreParamExport) -> torch.Tensor:
 def prime_delta_snapshots(index, snapshots, *, pin=False):
     """Keep baseline snapshots on the host to leave accelerator memory for training."""
     for record in index:
-        if record.param is None or not record.spec.contributes:
+        if record.param is None or not record.contributes:
             continue
         local = _device_shard(record)
         snapshot = torch.empty_like(local, device="cpu", pin_memory=pin)
@@ -518,10 +521,41 @@ class _SnapshotRefreshQueue:
         self.nbytes = 0
 
 
+def shard_delta_mask(local_new, local_snap):
+    """The same bit comparison as verl, used by batched extraction."""
+    int_dtype = _DTYPE_INT.get(local_new.element_size())
+    if int_dtype is None:
+        raise ValueError(f"unsupported element size {local_new.element_size()}")
+    return local_new.view(int_dtype) != local_snap.view(int_dtype)
+
+
+def compact_shard_masks(locals_, masks):
+    """One ordered nonzero per bounded batch, matching per-shard bit diffs.
+
+    Masks remain bitwise comparisons, as in verl. Only the variable-length
+    extraction is batched. The single boundary vector D2H replaces per-shard
+    dynamic shape synchronization; no HF mapping or ownership changes here.
+    """
+    if not locals_:
+        return []
+    ends, total = [], 0
+    for local in locals_:
+        total += local.numel()
+        ends.append(total)
+    positions = torch.cat(masks).nonzero(as_tuple=False).view(-1)
+    boundaries = torch.tensor(ends, dtype=torch.int64, device=positions.device)
+    splits = torch.searchsorted(positions, boundaries).cpu().tolist()
+    result, start, base = [], 0, 0
+    for local, end, boundary in zip(locals_, splits, ends, strict=True):
+        indices = positions[start:end] - base
+        row = (indices, local.index_select(0, indices))
+        result.append(row)
+        start, base = end, boundary
+    return result
+
+
 def iter_delta_entries(index, snapshots, *, batch_size=32):
     """Batch dynamic diff extraction, preserving verl's record/slot ordering."""
-    from .delta_sync.sparse_gather import compact_shard_masks, shard_delta_mask
-
     max_mask_bytes = 32 << 20
     pending, masks, locals_ = [], [], []
     staging = {}
@@ -545,7 +579,7 @@ def iter_delta_entries(index, snapshots, *, batch_size=32):
                 values = torch.empty(0, dtype=dtype, device=device)
             yield (
                 *mcore_hf_delta_entry(record, indices, values),
-                record.spec.gather_group,
+                record.gather_group,
             )
         pending.clear()
         masks.clear()
@@ -553,7 +587,7 @@ def iter_delta_entries(index, snapshots, *, batch_size=32):
 
     for record in index:
         local = _device_shard(record) if record.param is not None else None
-        active = local is not None and record.spec.contributes
+        active = local is not None and record.contributes
         key = (local.device, local.dtype) if active else batch_key
         size = local.numel() if active else 0
         if pending and (key != batch_key or mask_bytes + size > max_mask_bytes or len(pending) >= batch_size):

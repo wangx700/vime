@@ -52,7 +52,7 @@ delta 始终用 zstd（level 1）压缩；profiling 显示对这类数据它在 
 ### Sparse HCCL
 
 1. 通过 Megatron-Bridge 建立导出索引。首轮全量也使用
-   `HfWeightIteratorSparseBridge`，sparse 路径不调用直接映射导出器。
+   `HfWeightIteratorBridge`，sparse 路径不调用直接映射导出器。
 2. 为首轮实际训练权重生成完整 int32 checkpoint 坐标与目标值，按字节预算分片，
    使用`send_weight_chunk` 发送。重连后也能覆盖旧 worker 状态，不假定其
    仍等于初始 checkpoint。接收端仍需完整形状 NaN staging，首轮 wire 大于 dense 值传输。
@@ -67,6 +67,14 @@ delta 始终用 zstd（level 1）压缩；profiling 显示对这类数据它在 
    int32 大张量边界限制。wire 仍为 int32；输入校验和独立正确性 oracle 保留。
 
 两份依赖 patch 必须配套安装。Sparse HCCL 采用 unpacked 传输。
+
+实现按职责拆分在 `vime/backends/megatron_utils/update_weight/` 下：
+
+- `hf_weight_iterator_bridge.py`：通过 Bridge 完整导出 HF 权重，用于首轮 seed 和 checkpoint 对照。
+- `megatron_delta_export.py`：维护导出索引、快照和 bitwise diff，并转换为 HF 坐标；
+  `McoreParamExport` 直接保存聚合组与当前 rank 是否贡献数据。
+- `sparse_gather.py`：集中维护 `_GatherQueue`、变长聚合及可复用通信缓冲。
+- `update_weight_from_sparse_hccl.py`：管理更新会话、seed/delta 调度、分片发布和失败状态。
 
 ### 端到端权重与推理对照
 

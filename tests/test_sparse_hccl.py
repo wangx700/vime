@@ -43,15 +43,14 @@ from vllm.model_executor.model_loader.checkpoint_weight_patch import (
 
 import vime.backends.megatron_utils  # noqa: F401 - Bootstrap NPU before importing Megatron.
 from vime.backends.megatron_utils.update_weight import megatron_delta_export
+from vime.backends.megatron_utils.update_weight import sparse_gather as gather_module
 from vime.backends.megatron_utils.update_weight import update_weight_from_sparse_hccl as updater_module
-from vime.backends.megatron_utils.update_weight.delta_sync import sparse_gather as gather_module
-from vime.backends.megatron_utils.update_weight.delta_sync.sparse_gather import (
-    GatherWorkspace,
+from vime.backends.megatron_utils.update_weight.megatron_delta_export import (
+    _device_shard,
     compact_shard_masks,
-    gather_slot_entries_to_rank0,
     shard_delta_mask,
 )
-from vime.backends.megatron_utils.update_weight.megatron_delta_export import _device_shard
+from vime.backends.megatron_utils.update_weight.sparse_gather import GatherWorkspace, gather_slot_entries_to_rank0
 
 TP = 2
 PP = 2
@@ -92,8 +91,8 @@ def _compare_sparse_with_full_weights(model, cfg_dir, rank):
     """Require sparse reconstruction to equal full export, including untouched weights."""
     from types import SimpleNamespace
 
-    from vime.backends.megatron_utils.update_weight.hf_weight_iterator_sparse_bridge import (
-        HfWeightIteratorSparseBridge as HfWeightIteratorBridge,
+    from vime.backends.megatron_utils.update_weight.hf_weight_iterator_bridge import (
+        HfWeightIteratorBridge,
     )
     from vime.backends.megatron_utils.update_weight.megatron_delta_export import (
         build_export_index,
@@ -101,7 +100,7 @@ def _compare_sparse_with_full_weights(model, cfg_dir, rank):
         prime_delta_snapshots,
         validate_export_weights,
     )
-    from vime.backends.megatron_utils.update_weight.update_weight_from_sparse_hccl import _GatherQueue
+    from vime.backends.megatron_utils.update_weight.sparse_gather import _GatherQueue
 
     iterator = HfWeightIteratorBridge(SimpleNamespace(hf_checkpoint=cfg_dir, update_weight_buffer_size=4096), model)
     with iterator.model_context():
@@ -172,7 +171,7 @@ def _run_sparse_full_comparison(rank, cfg_dir):
 
     from megatron.bridge import AutoBridge
 
-    from vime.backends.megatron_utils.update_weight.hf_weight_iterator_sparse_bridge import (
+    from vime.backends.megatron_utils.update_weight.hf_weight_iterator_bridge import (
         configure_bridge_module_types,
     )
 
@@ -336,7 +335,8 @@ def test_nonempty_delta_always_uses_bridge_converter(monkeypatch, batch_size):
         megatron_name="weight",
         slots=[("weight", (2, 2))],
         hf_vocab_size=None,
-        spec=SimpleNamespace(contributes=True, gather_group=None),
+        contributes=True,
+        gather_group=None,
     )
     entries = list(
         megatron_delta_export.iter_delta_entries(
@@ -359,7 +359,7 @@ def test_snapshot_is_independent_and_requires_live_weights(monkeypatch):
         _device_shard(SimpleNamespace(param=torch.ones(4), megatron_name="weight"))
     local = torch.arange(4, dtype=torch.bfloat16)
     monkeypatch.setattr(megatron_delta_export, "_device_shard", lambda record: local)
-    record = SimpleNamespace(param=local, spec=SimpleNamespace(contributes=True), megatron_name="weight")
+    record = SimpleNamespace(param=local, contributes=True, megatron_name="weight")
     snapshots = {}
     megatron_delta_export.prime_delta_snapshots([record], snapshots)
     snapshot = snapshots["weight"]
@@ -417,7 +417,7 @@ def test_pp_placeholders_share_owner_dtype(monkeypatch):
     monkeypatch.setattr(torch.distributed, "get_world_size", lambda: 3)
     monkeypatch.setattr(torch.accelerator, "current_device_index", lambda: "cpu")
     for conflicting in (False, True):
-        record = SimpleNamespace(param=None, megatron_name="remote", spec=SimpleNamespace(gather_group=None))
+        record = SimpleNamespace(param=None, megatron_name="remote", gather_group=None)
         rows = [[None], [(slots, torch.float32)], [(slots, torch.bfloat16 if conflicting else torch.float32)]]
         monkeypatch.setattr(
             torch.distributed,

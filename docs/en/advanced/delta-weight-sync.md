@@ -60,7 +60,7 @@ Deltas are always zstd-compressed (level 1); profiling showed it dominates lz4 /
 ### Sparse HCCL
 
 1. Build the export index using Megatron-Bridge. First-sync full exports also use
-   `HfWeightIteratorSparseBridge`; this sparse path does not call the direct exporter.
+   `HfWeightIteratorBridge`; this sparse path does not call the direct exporter.
 2. Represent every initial checkpoint position as an int32 index and target value,
    split by the wire byte budget, and call `send_weight_chunk`. This seeds
    actual training weights even after reconnecting to previously modified workers.
@@ -80,6 +80,18 @@ Deltas are always zstd-compressed (level 1); profiling showed it dominates lz4 /
    remain int32. Input validation and dedicated correctness oracles stay enabled.
 
 Both dependency patches must be installed together. Sparse transport is unpacked.
+
+The implementation lives in `vime/backends/megatron_utils/update_weight/`:
+
+- `hf_weight_iterator_bridge.py` exports complete HF weights through Bridge for
+  the initial seed and checkpoint comparison.
+- `megatron_delta_export.py` maintains the export index and snapshots, computes
+  bitwise differences and converts them to HF coordinates. `McoreParamExport`
+  directly records the gather group and whether this rank contributes data.
+- `sparse_gather.py` owns `_GatherQueue`, variable-length gathering and reusable
+  communication buffers.
+- `update_weight_from_sparse_hccl.py` manages update sessions, seed/delta
+  scheduling, chunk publication and failure state.
 
 ### End-to-end checkpoint comparison
 

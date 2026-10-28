@@ -1,11 +1,9 @@
-"""Verl sharded delta semantics with HCCL placement and batched extraction."""
+"""Ordered sparse gather queues and reusable communication buffers."""
 
 from __future__ import annotations
 
 import torch
 import torch.distributed as dist
-
-_DTYPE_INT = {1: torch.uint8, 2: torch.int16, 4: torch.int32, 8: torch.int64}
 
 
 class GatherWorkspace:
@@ -24,14 +22,6 @@ class GatherWorkspace:
             buffer = reference.new_empty(size)
             self.buffers[key] = buffer
         return buffer[:size]
-
-
-def shard_delta_mask(local_new, local_snap):
-    """The same bit comparison as verl, used by batched extraction."""
-    int_dtype = _DTYPE_INT.get(local_new.element_size())
-    if int_dtype is None:
-        raise ValueError(f"unsupported element size {local_new.element_size()}")
-    return local_new.view(int_dtype) != local_snap.view(int_dtype)
 
 
 def gather_slot_entries_to_rank0(
@@ -184,26 +174,67 @@ def gather_slot_entries_to_rank0(
     return result
 
 
-def compact_shard_masks(locals_, masks):
-    """One ordered nonzero per bounded batch, matching per-shard bit diffs.
+class _GatherQueue:
+    """Count-triggered queues preserving collective order on every rank."""
 
-    Masks remain bitwise comparisons, as in verl. Only the variable-length
-    extraction is batched. The single boundary vector D2H replaces per-shard
-    dynamic shape synchronization; no HF mapping or ownership changes here.
-    """
-    if not locals_:
-        return []
-    ends, total = [], 0
-    for local in locals_:
-        total += local.numel()
-        ends.append(total)
-    positions = torch.cat(masks).nonzero(as_tuple=False).view(-1)
-    boundaries = torch.tensor(ends, dtype=torch.int64, device=positions.device)
-    splits = torch.searchsorted(positions, boundaries).cpu().tolist()
-    result, start, base = [], 0, 0
-    for local, end, boundary in zip(locals_, splits, ends, strict=True):
-        indices = positions[start:end] - base
-        row = (indices, local.index_select(0, indices))
-        result.append(row)
-        start, base = end, boundary
-    return result
+    def __init__(self, batch_size: int, max_round_bytes: int, is_wire_master: bool, consume, workspaces=None):
+        self.batch_size = max(int(batch_size), 1)
+        self.max_round_bytes = int(max_round_bytes)
+        self.is_wire_master = is_wire_master
+        self.consume = consume
+        self.workspaces = workspaces if workspaces is not None else {}
+        self.queues: dict[tuple[int, str], tuple] = {}
+
+    def put(self, group, slots, dtype_name, counts, indices, values) -> None:
+        key = (id(group), dtype_name)
+        _group, _dtype, entries = self.queues.setdefault(key, (group, dtype_name, []))
+        entries.append((slots, counts, indices, values))
+        if len(entries) >= self.batch_size:
+            self._flush(group, dtype_name, entries)
+
+    def flush_all(self) -> None:
+        for group, dtype_name, entries in self.queues.values():
+            self._flush(group, dtype_name, entries)
+
+    def _flush(self, group, dtype_name, entries) -> None:
+        if not entries:
+            return
+        batch = list(entries)
+        entries.clear()
+        if group is None:
+            if self.is_wire_master:
+                for slots, counts, indices, values in batch:
+                    offset = 0
+                    for (name, shape), count in zip(slots, counts.tolist(), strict=True):
+                        self.consume(
+                            name,
+                            dtype_name,
+                            tuple(shape),
+                            indices[offset : offset + count],
+                            values[offset : offset + count],
+                        )
+                        offset += count
+            return
+
+        counts = torch.cat([entry[1] for entry in batch])
+        indices = torch.cat([entry[2] for entry in batch])
+        values = torch.cat([entry[3] for entry in batch])
+        workspace_key = (id(group), dtype_name)
+        workspace = self.workspaces.get(workspace_key)
+        if workspace is None:
+            workspace = self.workspaces[workspace_key] = GatherWorkspace()
+        gathered = gather_slot_entries_to_rank0(
+            indices,
+            values,
+            counts,
+            group=group,
+            max_round_bytes=self.max_round_bytes,
+            workspace=workspace,
+        )
+        if self.is_wire_master and gathered is not None:
+            gathered_index = 0
+            for slots, _counts, _indices, _values in batch:
+                for name, shape in slots:
+                    merged_indices, merged_values = gathered[gathered_index]
+                    gathered_index += 1
+                    self.consume(name, dtype_name, tuple(shape), merged_indices, merged_values)

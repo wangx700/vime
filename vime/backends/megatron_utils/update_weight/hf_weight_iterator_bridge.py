@@ -1,4 +1,4 @@
-"""Stream the same real Bridge mappings used by the sparse delta probe.
+"""Stream complete HF weights through the real Bridge mappings.
 
 The sparse exporter keeps a standalone Bridge iterator; ordinary full and
 disk transfers retain the upstream direct iterator and weight source.
@@ -25,7 +25,7 @@ def configure_bridge_module_types():
     AutoMapping.register_module_type(LinearCrossEntropyModule.__name__, "column")
 
 
-class HfWeightIteratorSparseBridge:
+class HfWeightIteratorBridge:
     def __init__(self, args, model):
         from megatron.bridge import AutoBridge
 

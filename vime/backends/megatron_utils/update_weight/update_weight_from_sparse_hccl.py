@@ -21,15 +21,14 @@ from vllm_ascend.distributed.weight_transfer.sparse_hccl_engine import (
 from vime.utils.distributed_utils import get_gloo_group
 
 from .common import VimeRayWeightSyncClient
-from .delta_sync import gather_slot_entries_to_rank0
-from .delta_sync.sparse_gather import GatherWorkspace
-from .hf_weight_iterator_sparse_bridge import HfWeightIteratorSparseBridge
+from .hf_weight_iterator_bridge import HfWeightIteratorBridge
 from .megatron_delta_export import (
     build_export_index,
     iter_delta_entries,
     prime_delta_snapshots,
     validate_export_weights,
 )
+from .sparse_gather import _GatherQueue
 
 logger = logging.getLogger(__name__)
 
@@ -77,72 +76,6 @@ def prepare_sparse_patches(patches: Sequence[SparseWeightPatch], device) -> list
     if duplicate_checks and torch.stack(duplicate_checks).any().item():
         raise ValueError("Sparse payload contains duplicate indices")
     return prepared
-
-
-class _GatherQueue:
-    """Count-triggered queues preserving collective order on every rank."""
-
-    def __init__(self, batch_size: int, max_round_bytes: int, is_wire_master: bool, consume, workspaces=None):
-        self.batch_size = max(int(batch_size), 1)
-        self.max_round_bytes = int(max_round_bytes)
-        self.is_wire_master = is_wire_master
-        self.consume = consume
-        self.workspaces = workspaces if workspaces is not None else {}
-        self.queues: dict[tuple[int, str], tuple] = {}
-
-    def put(self, group, slots, dtype_name, counts, indices, values) -> None:
-        key = (id(group), dtype_name)
-        _group, _dtype, entries = self.queues.setdefault(key, (group, dtype_name, []))
-        entries.append((slots, counts, indices, values))
-        if len(entries) >= self.batch_size:
-            self._flush(group, dtype_name, entries)
-
-    def flush_all(self) -> None:
-        for group, dtype_name, entries in self.queues.values():
-            self._flush(group, dtype_name, entries)
-
-    def _flush(self, group, dtype_name, entries) -> None:
-        if not entries:
-            return
-        batch = list(entries)
-        entries.clear()
-        if group is None:
-            if self.is_wire_master:
-                for slots, counts, indices, values in batch:
-                    offset = 0
-                    for (name, shape), count in zip(slots, counts.tolist(), strict=True):
-                        self.consume(
-                            name,
-                            dtype_name,
-                            tuple(shape),
-                            indices[offset : offset + count],
-                            values[offset : offset + count],
-                        )
-                        offset += count
-            return
-
-        counts = torch.cat([entry[1] for entry in batch])
-        indices = torch.cat([entry[2] for entry in batch])
-        values = torch.cat([entry[3] for entry in batch])
-        workspace_key = (id(group), dtype_name)
-        workspace = self.workspaces.get(workspace_key)
-        if workspace is None:
-            workspace = self.workspaces[workspace_key] = GatherWorkspace()
-        gathered = gather_slot_entries_to_rank0(
-            indices,
-            values,
-            counts,
-            group=group,
-            max_round_bytes=self.max_round_bytes,
-            workspace=workspace,
-        )
-        if self.is_wire_master and gathered is not None:
-            gathered_index = 0
-            for slots, _counts, _indices, _values in batch:
-                for name, shape in slots:
-                    merged_indices, merged_values = gathered[gathered_index]
-                    gathered_index += 1
-                    self.consume(name, dtype_name, tuple(shape), merged_indices, merged_values)
 
 
 class _SparseFlushBucket:
@@ -197,7 +130,7 @@ class UpdateWeightFromSparseHCCL:
         self.args = args
         self.model = model
         self.weight_version = 0
-        self._iterator = HfWeightIteratorSparseBridge(args, model)
+        self._iterator = HfWeightIteratorBridge(args, model)
         self._index = None
         self._snapshots: dict[str, torch.Tensor] = {}
         self._seeded = False
