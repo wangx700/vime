@@ -212,7 +212,10 @@ def execute():
                 ),
             },
         )
-        metrics = json.loads((case_dir / "round-metrics.json").read_text())
+        metrics_path = case_dir / "round-metrics.json"
+        if not metrics_path.is_file():
+            raise AssertionError(f"Training job completed without writing update metrics: {case_dir}")
+        metrics = json.loads(metrics_path.read_text())
         verify_checkpoints(case_dir, encoding, metrics)
 
 
