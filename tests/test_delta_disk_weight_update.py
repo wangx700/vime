@@ -207,6 +207,9 @@ def execute():
                 "DISK_DELTA_BASELINE_PROMPT": BASELINE_PROMPT,
                 "DISK_DELTA_BASELINE_TOKENS": os.environ.get("DISK_DELTA_BASELINE_TOKENS", "64"),
                 "DISK_DELTA_ENCODING": encoding,
+                "ASCEND_RT_VISIBLE_DEVICES": os.environ.get(
+                    "ASCEND_RT_VISIBLE_DEVICES", ",".join(str(device) for device in range(NUM_GPUS))
+                ),
             },
         )
         metrics = json.loads((case_dir / "round-metrics.json").read_text())
