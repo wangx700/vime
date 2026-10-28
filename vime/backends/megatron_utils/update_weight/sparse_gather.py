@@ -177,12 +177,15 @@ def gather_slot_entries_to_rank0(
 class _GatherQueue:
     """Count-triggered queues preserving collective order on every rank."""
 
-    def __init__(self, batch_size: int, max_round_bytes: int, is_wire_master: bool, consume, workspaces=None):
+    def __init__(
+        self, batch_size: int, max_round_bytes: int, is_wire_master: bool, consume, workspaces=None, sync_error=None
+    ):
         self.batch_size = max(int(batch_size), 1)
         self.max_round_bytes = int(max_round_bytes)
         self.is_wire_master = is_wire_master
         self.consume = consume
         self.workspaces = workspaces if workspaces is not None else {}
+        self.sync_error = sync_error
         self.queues: dict[tuple[int, str], tuple] = {}
 
     def put(self, group, slots, dtype_name, counts, indices, values) -> None:
@@ -199,6 +202,20 @@ class _GatherQueue:
     def _flush(self, group, dtype_name, entries) -> None:
         if not entries:
             return
+        error = None
+        try:
+            self._gather_and_consume(group, dtype_name, entries)
+        except BaseException as exc:
+            if self.sync_error is None:
+                raise
+            error = exc
+        # Every trainer rank visits the same queue boundaries, including empty
+        # payloads and replicated rows. Do not enter the next gather until the
+        # wire master's validation/publication outcome is known to every rank.
+        if self.sync_error is not None:
+            self.sync_error(error)
+
+    def _gather_and_consume(self, group, dtype_name, entries) -> None:
         batch = list(entries)
         entries.clear()
         if group is None:

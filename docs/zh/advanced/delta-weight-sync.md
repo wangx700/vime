@@ -67,6 +67,23 @@ delta 始终用 zstd（level 1）压缩；profiling 显示对这类数据它在 
    int32 大张量边界限制。wire 仍为 int32；输入校验和独立正确性 oracle 保留。
 
 两份依赖 patch 必须配套安装。Sparse HCCL 采用 unpacked 传输。
+训练侧还需 Megatron-Bridge，标准 NPU 安装流程没有安装它。历史 A5 验证使用
+v0.3.0，固定提交 `21b02e0cfb2f8ff907e0d8baee0c5205876c6812`：
+
+```bash
+python -m pip install --no-deps \
+  'git+https://github.com/NVIDIA-NeMo/Megatron-Bridge.git@21b02e0cfb2f8ff907e0d8baee0c5205876c6812'
+python -c 'from megatron.bridge import AutoBridge'
+```
+
+`--no-deps` 用于保留现有 NPU 训练与推理依赖。Bridge v0.3.0 声明 Transformers <5，
+历史 A5 使用的是 Transformers 5.17.0；该实测组合不代表普遍兼容。
+使用前应在目标环境运行 Bridge 导出回归。
+
+每次 gather 队列 flush 后，训练 ranks 都先同步发布结果，再进入下一次 gather，
+包括复制参数和空 payload 的批次，避免 rank0 发布失败后集合通信顺序分叉。
+Ascend sparse engine 按 PR18915 在引擎内部管理 checkpoint loader 视图；
+固定的旧 Ascend 版本保留原有 HCCL 初始化接口。
 
 实现按职责拆分在 `vime/backends/megatron_utils/update_weight/` 下：
 

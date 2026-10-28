@@ -2,7 +2,7 @@ diff --git a/tests/ut/distributed/weight_transfer/test_sparse_hccl_engine.py b/t
 new file mode 100644
 --- /dev/null
 +++ b/tests/ut/distributed/weight_transfer/test_sparse_hccl_engine.py
-@@ -0,0 +1,122 @@
+@@ -0,0 +1,159 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Ascend-specific sparse HCCL configuration and cleanup checks."""
@@ -18,6 +18,7 @@ new file mode 100644
 +    SparseHCCLTrainerWeightTransferEngine,
 +    SparseHCCLWeightTransferEngine,
 +    SparseWeightPatch,
++    _checkpoint_weight_loader_view,
 +    checkpoint_loader_views,
 +)
 +
@@ -97,7 +98,7 @@ new file mode 100644
 +
 +
 +@pytest.mark.parametrize("failure", [None, "entry", "loading"])
-+def test_checkpoint_loader_views_unwind_all_layers(failure):
++def test_checkpoint_loader_views_unwind_all_layers(monkeypatch, failure):
 +    events = []
 +
 +    @contextmanager
@@ -114,8 +115,10 @@ new file mode 100644
 +    for name in ("first", "second"):
 +        layer = torch.nn.Module()
 +        layer.name = name
-+        layer.quant_method = SimpleNamespace(checkpoint_weight_loader_view=view)
 +        model.add_module(name, layer)
++    module = "vllm_ascend.distributed.weight_transfer.sparse_hccl_engine"
++    monkeypatch.setattr(f"{module}._checkpoint_loader_layers", lambda model: model.children())
++    monkeypatch.setattr(f"{module}._checkpoint_weight_loader_view", view)
 +    expected = [("enter", "first")]
 +    if failure != "entry":
 +        expected.append(("enter", "second"))
@@ -125,32 +128,17 @@ new file mode 100644
 +            raise RuntimeError("loading")
 +    expected += [("exit", name) for _, name in reversed(expected)]
 +    assert events == expected
-diff --git a/tests/ut/ops/test_routed_experts.py b/tests/ut/ops/test_routed_experts.py
-index 9591da90b..08a2fbaf6 100644
---- a/tests/ut/ops/test_routed_experts.py
-+++ b/tests/ut/ops/test_routed_experts.py
-@@ -6,7 +6,47 @@ from types import SimpleNamespace
- import pytest
- import torch
- 
--from vllm_ascend.ops.fused_moe.routed_experts import AscendRoutedExperts, EplbExpertTensorList
-+from vllm_ascend.ops.fused_moe.routed_experts import (
-+    AscendRoutedExperts,
-+    AscendUnquantizedFusedMoEMethod,
-+    EplbExpertTensorList,
-+)
 +
 +
 +@pytest.mark.parametrize("fail", [False, True])
 +def test_checkpoint_loader_view_preserves_storage_and_restores_layout(monkeypatch, fail):
 +    monkeypatch.setattr("torch_npu.get_npu_format", lambda parameter: 2, raising=False)
-+    method = object.__new__(AscendUnquantizedFusedMoEMethod)
 +    layer = torch.nn.Module()
 +    layer.w13_weight = torch.nn.Parameter(torch.zeros(2, 3, 8))
 +    layer.w2_weight = torch.nn.Parameter(torch.zeros(2, 4, 3))
 +    addresses = [p.data_ptr() for p in layer.parameters()]
 +    try:
-+        with torch.no_grad(), method.checkpoint_weight_loader_view(layer):
++        with torch.no_grad(), _checkpoint_weight_loader_view(layer):
 +            assert layer.w13_weight.shape == (2, 8, 3)
 +            assert layer.w2_weight.shape == (2, 3, 4)
 +            layer.w13_weight[1, 7, 2] = 9
@@ -169,15 +157,11 @@ index 9591da90b..08a2fbaf6 100644
 +@pytest.mark.parametrize("nz", [False, True])
 +def test_checkpoint_loader_view_rejects_unsupported_expert_storage(monkeypatch, nz):
 +    monkeypatch.setattr("torch_npu.get_npu_format", lambda parameter: 29, raising=False)
-+    method = object.__new__(AscendUnquantizedFusedMoEMethod)
 +    layer = SimpleNamespace()
 +    if nz:
 +        layer.w13_weight = layer.w2_weight = torch.nn.Parameter(torch.zeros(2, 3, 4))
-+    with pytest.raises(NotImplementedError), method.checkpoint_weight_loader_view(layer):
++    with pytest.raises(NotImplementedError), _checkpoint_weight_loader_view(layer):
 +        pytest.fail("unsupported layout entered")
- 
- 
- def _routed_experts(weight_views):
 diff --git a/vllm_ascend/distributed/device_communicators/pyhccl.py b/vllm_ascend/distributed/device_communicators/pyhccl.py
 index 44d1b12fc..286a85394 100644
 --- a/vllm_ascend/distributed/device_communicators/pyhccl.py
@@ -812,7 +796,7 @@ diff --git a/vllm_ascend/distributed/weight_transfer/sparse_hccl_engine.py b/vll
 new file mode 100644
 --- /dev/null
 +++ b/vllm_ascend/distributed/weight_transfer/sparse_hccl_engine.py
-@@ -0,0 +1,163 @@
+@@ -0,0 +1,194 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""HCCL transport for upstream sparse weight transfer engines."""
@@ -858,15 +842,48 @@ new file mode 100644
 +]
 +
 +
++def _checkpoint_loader_layers(model: torch.nn.Module) -> Iterator[torch.nn.Module]:
++    from vllm_ascend.ops.fused_moe.routed_experts import AscendUnquantizedFusedMoEMethod
++
++    for layer in model.modules():
++        if isinstance(getattr(layer, "quant_method", None), AscendUnquantizedFusedMoEMethod):
++            yield layer
++
++
++def _validate_checkpoint_weight_loader_view(layer: torch.nn.Module) -> None:
++    import torch_npu
++
++    parameters = [getattr(layer, name, None) for name in ("w13_weight", "w2_weight")]
++    if any(parameter is None for parameter in parameters):
++        raise NotImplementedError("Checkpoint sparse updates require unsplit ND expert weights")
++    if any(torch_npu.get_npu_format(parameter) not in (0, 2) for parameter in parameters):
++        raise NotImplementedError("Checkpoint sparse updates require ND expert weights")
++
++
++@contextmanager
++def _checkpoint_weight_loader_view(layer: torch.nn.Module) -> Iterator[None]:
++    """Expose [expert, output, input] views over Ascend's transposed storage.
++
++    Restore inference views even if loading fails; written values are not rolled back.
++    """
++    _validate_checkpoint_weight_loader_view(layer)
++    parameters = [layer.w13_weight, layer.w2_weight]
++    originals = [parameter.data for parameter in parameters]
++    try:
++        for parameter, original in zip(parameters, originals):
++            parameter.data = original.transpose(1, 2)
++        yield
++    finally:
++        for parameter, original in zip(parameters, originals):
++            parameter.data = original
++
++
 +@contextmanager
 +def checkpoint_loader_views(model: torch.nn.Module) -> Iterator[None]:
 +    """Expose loader layouts while preserving the inference tensor storage."""
 +    with ExitStack() as stack:
-+        for layer in model.modules():
-+            method = getattr(layer, "quant_method", None)
-+            view = getattr(method, "checkpoint_weight_loader_view", None)
-+            if view is not None:
-+                stack.enter_context(view(layer))
++        for layer in _checkpoint_loader_layers(model):
++            stack.enter_context(_checkpoint_weight_loader_view(layer))
 +        yield
 +
 +
@@ -891,10 +908,8 @@ new file mode 100644
 +            raise NotImplementedError("Sparse HCCL does not support EPLB")
 +        if self.model_config.quantization is not None:
 +            raise NotImplementedError("Sparse HCCL requires unquantized floating-point weights")
-+        for layer in self.model.modules():
-+            validate = getattr(getattr(layer, "quant_method", None), "validate_checkpoint_weight_loader_view", None)
-+            if validate is not None:
-+                validate(layer)
++        for layer in _checkpoint_loader_layers(self.model):
++            _validate_checkpoint_weight_loader_view(layer)
 +        for parameter in self.model.parameters():
 +            if parameter.device.type == "npu":
 +                import torch_npu
@@ -976,50 +991,3 @@ new file mode 100644
 +            # the HCCL communicator here to release native resources before dropping the reference.
 +            self.model_update_group.close()
 +            self.model_update_group = None
-diff --git a/vllm_ascend/ops/fused_moe/routed_experts.py b/vllm_ascend/ops/fused_moe/routed_experts.py
-index c328def60..a39926cb1 100644
---- a/vllm_ascend/ops/fused_moe/routed_experts.py
-+++ b/vllm_ascend/ops/fused_moe/routed_experts.py
-@@ -15,6 +15,7 @@
- # limitations under the License.
- #
- from collections.abc import Iterable
-+from contextlib import contextmanager
- from copy import copy
- from types import SimpleNamespace
- 
-@@ -87,6 +88,34 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
-     def supports_fused_activation(self, activation) -> bool:
-         return False
- 
-+    @staticmethod
-+    def validate_checkpoint_weight_loader_view(layer):
-+        parameters = [getattr(layer, name, None) for name in ("w13_weight", "w2_weight")]
-+        if any(parameter is None for parameter in parameters):
-+            raise NotImplementedError("Checkpoint sparse updates require unsplit ND expert weights")
-+        if any(torch_npu.get_npu_format(parameter) not in (0, 2) for parameter in parameters):
-+            raise NotImplementedError("Checkpoint sparse updates require ND expert weights")
-+
-+    @contextmanager
-+    def checkpoint_weight_loader_view(self, layer):
-+        """Temporarily undo the inference transpose without replacing storage.
-+
-+        The upstream expert loader expects [expert, output, input], whereas
-+        Ascend GMM consumes [expert, input, output]. Restoring the original
-+        views in finally also preserves graph addresses and parameter loaders.
-+        Split expert lists and NZ tensors need a different update mechanism.
-+        """
-+        self.validate_checkpoint_weight_loader_view(layer)
-+        parameters = [layer.w13_weight, layer.w2_weight]
-+        originals = [parameter.data for parameter in parameters]
-+        try:
-+            for parameter, original in zip(parameters, originals):
-+                parameter.data = original.transpose(1, 2)
-+            yield
-+        finally:
-+            for parameter, original in zip(parameters, originals):
-+                parameter.data = original
-+
-     def process_weights_after_loading(self, layer):
-         super(UnquantizedFusedMoEMethod, self).process_weights_after_loading(layer)
- 

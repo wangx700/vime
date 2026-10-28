@@ -26,6 +26,21 @@ PP=1, with EPLB disabled. Configure `--vllm-pipeline-parallel-size 1`.
 The receiver handles TP/DP/EP loading; inference PP>1 is rejected before
 communication initialization. Training-side PP/TP/EP export remains supported.
 
+Sparse export additionally requires Megatron-Bridge, which the standard NPU
+installation does not install. The historical A5 validation used v0.3.0 at
+`21b02e0cfb2f8ff907e0d8baee0c5205876c6812`:
+
+```bash
+python -m pip install --no-deps \
+  'git+https://github.com/NVIDIA-NeMo/Megatron-Bridge.git@21b02e0cfb2f8ff907e0d8baee0c5205876c6812'
+python -c 'from megatron.bridge import AutoBridge'
+```
+
+`--no-deps` preserves the installed NPU training/serving stack. Bridge v0.3.0
+declares Transformers <5; the historical A5 run used Transformers 5.17.0.
+That measured combination does not establish general dependency compatibility.
+Validate the Bridge export regression in the intended environment before use.
+
 The script `scripts/run-qwen3-30B-A3B-sparse-hccl.sh` uses training
 TP2/PP2/EP2 and rollout TP2/PP1/EP2, on four training plus two rollout NPUs.
 Set `DATA_ROOT` to the directory containing `weights/` and `datasets/`, and load
@@ -72,6 +87,8 @@ Deltas are always zstd-compressed (level 1); profiling showed it dominates lz4 /
 4. VIME normalizes device and contiguity and checks bounds, duplicate indices
    and NaNs. The sender checks patch structure and owns metadata and the
    concurrent receive RPC/broadcast; VIME owns pause/start/finish/resume.
+   After every gather queue flush, trainer ranks synchronize the publication
+   outcome before entering the next gather, including replicated and empty rows.
 5. The receiver uses temporary checkpoint-compatible MoE views and the model's
    original loader for TP/EP placement. There is no Ascend MoE direct-write path.
    Values replace positions, including zero; they are not additive deltas.
@@ -80,6 +97,8 @@ Deltas are always zstd-compressed (level 1); profiling showed it dominates lz4 /
    remain int32. Input validation and dedicated correctness oracles stay enabled.
 
 Both dependency patches must be installed together. Sparse transport is unpacked.
+The Ascend sparse engine follows PR18915's engine-owned checkpoint loader views;
+the pinned Ascend version retains its existing HCCL initialization API.
 
 The implementation lives in `vime/backends/megatron_utils/update_weight/`:
 

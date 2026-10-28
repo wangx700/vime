@@ -285,6 +285,82 @@ def _run_gather_regression():
         print("NPU-SPARSE-GATHER PASS: 20 cases; empty/unequal/noncontiguous/split/reused; FP32/BF16", flush=True)
 
 
+def _run_publish_failure_regression():
+    """All ranks must stop at the failed batch, using real trainer collectives."""
+    rank = dist.get_rank()
+    device = torch.device("npu", torch.npu.current_device())
+    for group in (dist.group.WORLD, None):
+        for batch_size in (1, 4):
+            for failure in (None, "validation", "send"):
+                instance = updater_module.UpdateWeightFromSparseHCCL.__new__(updater_module.UpdateWeightFromSparseHCCL)
+                instance.args = SimpleNamespace(
+                    update_weight_delta_batch_gather=batch_size,
+                    update_weight_delta_batch_diff=1,
+                    update_weight_buffer_size=8,
+                )
+                instance._client = object()
+                instance._failed = instance._needs_reconnect = False
+                instance._seeded = True
+                instance.weight_version = 1
+                instance._index, instance._snapshots, instance._gather_workspaces = [], {}, {}
+                instance._begin_update = instance._ensure_export_index = lambda: None
+                recovered, finished, visited, sent = [], [], [], []
+                instance._recover_before_payload = lambda recovered=recovered: recovered.append(True)
+                instance._finish_update = lambda finished=finished: finished.append(True)
+
+                def send(patches, sent=sent, failure=failure):
+                    sent.extend(patches)
+                    if failure == "send":
+                        raise RuntimeError("injected sender failure")
+
+                instance._trainer = SimpleNamespace(
+                    model_update_group=SimpleNamespace(device=device), send_weight_chunk=send
+                )
+
+                def entries(*args, visited=visited, group=group, failure=failure, **kwargs):
+                    for row in range(2):
+                        visited.append(row)
+                        count = int(group is not None or rank == 0)
+                        values = torch.ones(count, device=device)
+                        if failure == "validation" and rank == 0:
+                            values.fill_(float("nan"))
+                        yield (
+                            [(f"weight{row}", (dist.get_world_size(),))],
+                            "float32",
+                            torch.tensor([count]),
+                            torch.full((count,), rank, dtype=torch.int32, device=device),
+                            values,
+                            group,
+                        )
+
+                with pytest.MonkeyPatch.context() as patcher:
+                    patcher.setattr(updater_module, "iter_delta_entries", entries)
+                    patcher.setattr(updater_module, "validate_export_weights", lambda index: None)
+                    if failure:
+                        message = (
+                            ("Sparse payload" if failure == "validation" else "injected sender failure")
+                            if rank == 0
+                            else "gather/publish"
+                        )
+                        with pytest.raises((ValueError, RuntimeError), match=message):
+                            instance.update_weights()
+                    else:
+                        instance.update_weights()
+                assert visited == ([0] if failure and batch_size == 1 else [0, 1])
+                assert recovered == ([True] if failure == "validation" else [])
+                assert instance._failed == (failure == "send")
+                assert finished == ([] if failure else [True])
+                if rank == 0:
+                    expected = 2 * dist.get_world_size() if group is not None else 2
+                    assert len(sent) == (0 if failure == "validation" else 1 if failure == "send" else expected)
+                dist.barrier()
+    if rank == 0:
+        print(
+            "NPU-SPARSE-PUBLISH PASS: 12 cases; batched/residual/direct; validation/send failures and success",
+            flush=True,
+        )
+
+
 def _distributed_worker(rank, port, cfg_dir):
     """Initialize one rank and guarantee cleanup for success or failed assertions."""
     os.environ.update(
@@ -297,6 +373,7 @@ def _distributed_worker(rank, port, cfg_dir):
 
     init_gloo_group()
     try:
+        _run_publish_failure_regression()
         _run_gather_regression()
         _run_sparse_full_comparison(rank, cfg_dir)
     finally:

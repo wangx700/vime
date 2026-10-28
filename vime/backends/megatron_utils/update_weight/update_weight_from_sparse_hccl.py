@@ -284,6 +284,11 @@ class UpdateWeightFromSparseHCCL:
         self._payload_started = True
         self._trainer.send_weight_chunk(patches)
 
+    def _sync_publish_error(self, error: BaseException | None) -> None:
+        failed, _ = self._sync_update_state(error)
+        if failed:
+            self._raise_synchronized_error(error, "gather/publish")
+
     def _send_seed(self) -> None:
         """Seed new or reconnected workers from the complete training weights."""
         bucket = _SparseFlushBucket(self.args.update_weight_buffer_size, self._publish_flush)
@@ -317,6 +322,7 @@ class UpdateWeightFromSparseHCCL:
             dist.get_rank() == 0,
             consume,
             workspaces=self._gather_workspaces,
+            sync_error=self._sync_publish_error,
         )
         for slots, dtype_name, counts, indices, values, group in iter_delta_entries(
             self._index,
