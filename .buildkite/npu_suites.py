@@ -103,15 +103,6 @@ def npu_step(
         if test_name == "test_sparse_hccl.py"
         else f"python tests/{test_name}"
     )
-    # Sparse export uses Bridge; the standard NPU image does not install it.
-    bridge_setup = (
-        [
-            "python -m pip install --no-deps "
-            "git+https://github.com/NVIDIA-NeMo/Megatron-Bridge.git@21b02e0cfb2f8ff907e0d8baee0c5205876c6812"
-        ]
-        if test_name in {"test_sparse_hccl.py", "test_qwen3_30B_A3B_sparse_hccl_npu.py"}
-        else []
-    )
     commands = "\n".join(
         [
             'echo "INFO: update NPU environment"',
@@ -119,7 +110,6 @@ def npu_step(
             "  source /workspace/build/buildkite/.buildkite/scripts/update-npu-environment.sh",
             "fi",
             "export HF_HUB_OFFLINE=0",
-            *bridge_setup,
             f"{test_command}{' ' + extra_args if extra_args else ''}",
         ]
     )
