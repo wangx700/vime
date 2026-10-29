@@ -61,9 +61,9 @@ delta 始终用 zstd（level 1）压缩；profiling 显示对这类数据它在 
 3. **Publish。** 对 Diff 生成的变化项，先按一致目录执行变长 gather，聚合到 rank0。
    rank0 对 Seed 或 Diff 的 payload 检查边界、重复索引和 NaN，转到通信设备并连续化，按字节预算分片。
    sender 通过 `send_weight_chunk` 发布 metadata，并发启动接收 RPC 与 HCCL broadcast。
-4. **Apply。** rollout worker 接收坐标和值，通过 checkpoint-compatible MoE 视图调用
-   模型原生 loader，完成 TP/EP 放置并原地覆盖对应权重。values 是目标值，包含零值，
-   而不是需要累加的差值。
+4. **Apply。** rollout worker 通过 HCCL 接收 Publish 阶段广播的 checkpoint 坐标与目标值。
+   checkpoint 加载路径调用模型原生 loader，将这些更新映射到各 worker 的 TP 分片与本地专家，
+   再用收到的目标值原地覆盖对应权重，零值也会写入。
 
 wire 索引使用 int32，单个 checkpoint tensor 的元素数必须小于 `2**31`。
 接收端需要完整形状的 NaN staging；首轮 Seed 同时传输索引和值，wire 大于仅发送值的 dense 传输。

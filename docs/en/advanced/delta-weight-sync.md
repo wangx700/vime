@@ -74,10 +74,11 @@ Both paths share Publish and Apply.
    bounds, duplicate indices and NaNs, normalizes device and
    contiguity, and splits payloads by the byte budget. The sender publishes metadata
    through `send_weight_chunk` and runs receive RPCs and HCCL broadcasts concurrently.
-4. **Apply.** Rollout workers receive coordinates and values, then use checkpoint-compatible
-   MoE views and the model's native loader for TP/EP placement. Values overwrite
-   the corresponding weights in place, including zeros; they are target values,
-   not additive differences.
+4. **Apply.** Rollout workers receive the checkpoint coordinates and target values
+   broadcast through HCCL in Publish. The checkpoint loading path uses the model's
+   native loader to map these updates to each worker's TP shards and local experts,
+   then overwrites the corresponding weights in place with the received values,
+   including zeros.
 
 Wire indices are int32; each checkpoint tensor must contain fewer than `2**31`
 elements. The receiver requires full-shape NaN staging. Seed sends both indices
