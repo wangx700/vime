@@ -26,20 +26,7 @@ PP=1, with EPLB disabled. Configure `--vllm-pipeline-parallel-size 1`.
 The receiver handles TP/DP/EP loading; inference PP>1 is rejected before
 communication initialization. Training-side PP/TP/EP export remains supported.
 
-Sparse export additionally requires Megatron-Bridge, which the standard NPU
-installation does not install. The historical A5 validation used v0.3.0 at
-`21b02e0cfb2f8ff907e0d8baee0c5205876c6812`:
-
-```bash
-python -m pip install --no-deps \
-  'git+https://github.com/NVIDIA-NeMo/Megatron-Bridge.git@21b02e0cfb2f8ff907e0d8baee0c5205876c6812'
-python -c 'from megatron.bridge import AutoBridge'
-```
-
-`--no-deps` preserves the installed NPU training/serving stack. Bridge v0.3.0
-declares Transformers <5; the historical A5 run used Transformers 5.17.0.
-That measured combination does not establish general dependency compatibility.
-Validate the Bridge export regression in the intended environment before use.
+Sparse export requires Megatron-Bridge in the training environment.
 
 The script `scripts/run-qwen3-30B-A3B-sparse-hccl.sh` uses training
 TP2/PP2/EP2 and rollout TP2/PP1/EP2, on four training plus two rollout NPUs.
@@ -87,8 +74,6 @@ Deltas are always zstd-compressed (level 1); profiling showed it dominates lz4 /
 4. VIME normalizes device and contiguity and checks bounds, duplicate indices
    and NaNs. The sender checks patch structure and owns metadata and the
    concurrent receive RPC/broadcast; VIME owns pause/start/finish/resume.
-   After every gather queue flush, trainer ranks synchronize the publication
-   outcome before entering the next gather, including replicated and empty rows.
 5. The receiver uses temporary checkpoint-compatible MoE views and the model's
    original loader for TP/EP placement. There is no Ascend MoE direct-write path.
    Values replace positions, including zero; they are not additive deltas.
@@ -97,20 +82,6 @@ Deltas are always zstd-compressed (level 1); profiling showed it dominates lz4 /
    remain int32. Input validation and dedicated correctness oracles stay enabled.
 
 Both dependency patches must be installed together. Sparse transport is unpacked.
-The Ascend sparse engine follows PR18915's engine-owned checkpoint loader views;
-the pinned Ascend version retains its existing HCCL initialization API.
-
-The implementation lives in `vime/backends/megatron_utils/update_weight/`:
-
-- `hf_weight_iterator_bridge.py` exports complete HF weights through Bridge for
-  the initial seed and checkpoint comparison.
-- `megatron_delta_export.py` maintains the export index and snapshots, computes
-  bitwise differences and converts them to HF coordinates. `McoreParamExport`
-  directly records the gather group and whether this rank contributes data.
-- `sparse_gather.py` owns `_GatherQueue`, variable-length gathering and reusable
-  communication buffers.
-- `update_weight_from_sparse_hccl.py` manages update sessions, seed/delta
-  scheduling, chunk publication and failure state.
 
 ### End-to-end checkpoint comparison
 
@@ -131,40 +102,6 @@ SPARSE_HCCL_RESULT_DIR=/local/nvme/sparse-check-001 \
 SPARSE_HCCL_BASELINE_PROMPT="What is 17 + 25? Give the answer in one sentence." \
 python tests/test_qwen3_30B_A3B_sparse_hccl_npu.py
 ```
-
-Use a fresh result directory with room for a full BF16 checkpoint (about 61 GB).
-Artifacts include `baseline.json`, `sparse-inference.json`,
-`checkpoint-inference.json`, and `comparison.json`. The latter records exact
-matching and maximum absolute logprob error; an exact pass requires zero error.
-A one-prompt match covers that prompt, not all possible model inputs.
-
-The sparse updater does not collect per-phase timing or transfer metrics.
-
-### Measured unpacked baseline
-
-The A5 six-NPU runs on 2026-10-27 completed the same training TP2/PP2/EP2 and
-rollout TP2/PP1/EP2 configuration. These measurements precede the ordered-index
-validation optimization; they do not establish a speedup for the new code.
-
-| Update | Full HCCL unpacked (s) | Sparse HCCL (s) | Sparse updated elements / seed | Sparse payload (MiB) |
-|---|---:|---:|---:|---:|
-| Initial seed | 63.7 | 100.8 | 100% | 174706.21 |
-| First delta | 52.4 | 31.0 | 0.1386% | 242.06 |
-| Second delta | 52.8 | 36.9 | 0.2048% | 357.88 |
-| Third delta | 52.5 | 37.4 | 0.2273% | 397.08 |
-
-Table note: seconds cover the complete `update_weights` wall-clock call, including
-preparation, transfer and receiver application. Full sends all weights each time.
-Sparse coverage counts scalar update events divided by 30532122624 seed elements;
-three deltas can update the same coordinate repeatedly. Payload includes int32
-indices and BF16 values, excluding protocol overhead. Steady means are 52.57 s
-and 35.10 s: sparse saves approximately 33.2% wall time against unpacked full.
-These runs did not compare generated-token logprobs with a fresh checkpoint load;
-that is the stricter acceptance check added by the script above.
-
-Updates are
-in-place and nontransactional; a possibly partial failure prevents updater reuse
-until reconnection and full seeding. Keep generation paused after such a failure.
 
 ### Disk transport
 

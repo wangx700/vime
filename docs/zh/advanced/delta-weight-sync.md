@@ -67,31 +67,7 @@ delta 始终用 zstd（level 1）压缩；profiling 显示对这类数据它在 
    int32 大张量边界限制。wire 仍为 int32；输入校验和独立正确性 oracle 保留。
 
 两份依赖 patch 必须配套安装。Sparse HCCL 采用 unpacked 传输。
-训练侧还需 Megatron-Bridge，标准 NPU 安装流程没有安装它。历史 A5 验证使用
-v0.3.0，固定提交 `21b02e0cfb2f8ff907e0d8baee0c5205876c6812`：
-
-```bash
-python -m pip install --no-deps \
-  'git+https://github.com/NVIDIA-NeMo/Megatron-Bridge.git@21b02e0cfb2f8ff907e0d8baee0c5205876c6812'
-python -c 'from megatron.bridge import AutoBridge'
-```
-
-`--no-deps` 用于保留现有 NPU 训练与推理依赖。Bridge v0.3.0 声明 Transformers <5，
-历史 A5 使用的是 Transformers 5.17.0；该实测组合不代表普遍兼容。
-使用前应在目标环境运行 Bridge 导出回归。
-
-每次 gather 队列 flush 后，训练 ranks 都先同步发布结果，再进入下一次 gather，
-包括复制参数和空 payload 的批次，避免 rank0 发布失败后集合通信顺序分叉。
-Ascend sparse engine 按 PR18915 在引擎内部管理 checkpoint loader 视图；
-固定的旧 Ascend 版本保留原有 HCCL 初始化接口。
-
-实现按职责拆分在 `vime/backends/megatron_utils/update_weight/` 下：
-
-- `hf_weight_iterator_bridge.py`：通过 Bridge 完整导出 HF 权重，用于首轮 seed 和 checkpoint 对照。
-- `megatron_delta_export.py`：维护导出索引、快照和 bitwise diff，并转换为 HF 坐标；
-  `McoreParamExport` 直接保存聚合组与当前 rank 是否贡献数据。
-- `sparse_gather.py`：集中维护 `_GatherQueue`、变长聚合及可复用通信缓冲。
-- `update_weight_from_sparse_hccl.py`：管理更新会话、seed/delta 调度、分片发布和失败状态。
+训练环境需安装 Megatron-Bridge。
 
 ### 端到端权重与推理对照
 
@@ -109,34 +85,6 @@ SPARSE_HCCL_RESULT_DIR=/local/nvme/sparse-check-001 \
 SPARSE_HCCL_BASELINE_PROMPT="What is 17 + 25? Give the answer in one sentence." \
 python tests/test_qwen3_30B_A3B_sparse_hccl_npu.py
 ```
-
-结果目录必须是新目录，预留约 61 GB 保存完整 BF16 权重。产物包括 `baseline.json`、
-`sparse-inference.json`、`checkpoint-inference.json` 和
-`comparison.json`。对比文件包含逐项相等判定和最大 logprob 绝对误差，严格通过要求误差
-为零。单个基线 prompt 的一致性结论仅覆盖该输入。
-
-Sparse updater 不再采集分段耗时或传输统计。
-
-### 当前 unpacked 实测基线
-
-2026-10-27 A5 六卡完整作业使用训练 TP2/PP2/EP2、推理 TP2/PP1/EP2。
-以下为索引校验优化前的结果，不能用于宣称本次新代码已获得性能提升。
-
-| 更新 | Full HCCL unpacked（秒） | Sparse HCCL（秒） | Sparse 更新元素 / 完整 seed | Sparse payload（MiB） |
-|---|---:|---:|---:|---:|
-| 首轮 seed | 63.7 | 100.8 | 100% | 174706.21 |
-| 第一次 delta | 52.4 | 31.0 | 0.1386% | 242.06 |
-| 第二次 delta | 52.8 | 36.9 | 0.2048% | 357.88 |
-| 第三次 delta | 52.5 | 37.4 | 0.2273% | 397.08 |
-
-表注：时间为完整 `update_weights` 墙钟区间，包括发送前处理、通信和推理应用。
-Full 每轮全量发送；Sparse 比例为标量更新事件数除以 seed 的 30532122624 个元素，
-不同轮可能重复更新同一坐标。payload 包含 int32 索引与 BF16 值，不含网络协议开销。
-稳态均值分别为 52.57 秒与 35.10 秒，Sparse 相对 unpacked Full 节省约 33.2%。
-这些历史作业未与全新 checkpoint 加载逐 token 对比 logprobs；上面的脚本新增了该严格验收。
-
-更新原地执行、不具备事务回滚；发生可能部分写入的失败后保持暂停，
-updater 不得继续复用，必须重连并重新全量 seed。
 
 ### 磁盘传输
 
