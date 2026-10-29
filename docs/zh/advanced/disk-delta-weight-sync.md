@@ -151,9 +151,9 @@ classDiagram
 
 ## 30B E2E 精度验证
 
-`tests/test_delta_disk_weight_update.py` 取代旧的 Qwen3-0.6B 文件级 smoke test，继续在同一测试里覆盖 XOR、overwrite。每种编码以 Qwen3-30B-A3B 执行基线初始化和两个真实训练 / 更新轮次：4 张 NPU 训练，另 2 张 NPU 给单个 vLLM 引擎。测试同时检查两个非空版本、索引链、本地状态版本以及所有最终重建权重的原始字节都与独立 HF checkpoint 一致。完整 checkpoint 通过训练模型的普通 HF 保存迭代器重新转换导出，不读取 delta 文件或本地 delta 快照。
+`tests/test_delta_disk_weight_update.py` 取代旧的 Qwen3-0.6B 文件级 smoke test，继续在同一测试里覆盖 XOR、overwrite。每种编码以 Qwen3-30B-A3B 执行基线初始化和两个真实训练 / 更新轮次，训练使用仓库现有 30B Megatron 并行配置：8 个训练 NPU、TP=4、PP=1、EP=8；单个 rollout 引擎使用 2 个 NPU。测试同时检查两个非空版本、索引链、本地状态版本以及所有最终重建权重的原始字节都与独立 HF checkpoint 一致。完整 checkpoint 通过训练模型的普通 HF 保存迭代器重新转换导出，不读取 delta 文件或本地 delta 快照。
 
-推理侧保存一组固定 prompt token IDs 和 greedy sampling 参数，在增量更新后的 rollout engine 上生成一次并重跑以检查可重复性；之后关闭原服务，在相同两张 NPU、拓扑和服务参数下启动新服务，从独立导出的 HF checkpoint 直接加载。两路生成必须有相同 token IDs、逐 token logprob 和 finish reason，缺失/非有限 logprob 也失败。比较文件报告是否完全匹配及最大绝对 logprob 差值；当前通过判定要求差值为精确零。
+推理侧保存一组固定 prompt token IDs 和 greedy sampling 参数，在增量更新后的 rollout engine 上生成一次并重跑以检查可重复性；之后关闭原服务，在相同 2 个 rollout NPU、拓扑和服务参数下启动新服务，从独立导出的 HF checkpoint 直接加载。两路生成必须有相同 token IDs、逐 token logprob 和 finish reason，缺失/非有限 logprob 也失败。比较文件报告是否完全匹配及最大绝对 logprob 差值；当前通过判定要求差值为精确零。
 
 这个比较为给定 checkpoint、软件栈、并行布局及单条提示提供严格的权重加载 / 同步一致性证据。它不能证明所有输入上的数学精度，也不能单独区分训练更新错误、HF 转换差异或推理内核数值差异；因此训练和独立 full export 使用同一 HF 格式及同一 engine 配置，比较中保存 prompt IDs 和完整采样参数以便复核。
 
@@ -169,7 +169,7 @@ classDiagram
 | `checked_full_checkpoint_tensors` | delta 重建与独立完整 checkpoint 逐张量字节比较数量，个 |
 | `max_abs_logprob_error` | 两服务生成 token logprob 的最大绝对差；成功要求精确为 `0.0` |
 
-表注：上述计数是 E2E 功能验证实际写出的字段，不代表已经完成实机测量。实机运行前不填写耗时、压缩率或精度数据；每个 `update_seconds` 单位为秒且仅覆盖同一进程内更新调用边界，不是端到端训练时长。
+表注：上述计数是 E2E 功能验证实际写出的字段；当前 A5 实机结果尚未完成，实测耗时、压缩率和精度数据待测试完成后同步。每个 `update_seconds` 单位为秒且仅覆盖同一进程内更新调用边界，不是端到端训练时长。
 
 ## 代码入口
 

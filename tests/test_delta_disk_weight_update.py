@@ -25,8 +25,8 @@ from vime.utils.disk_delta import checksum, make_tensor_reader
 
 MODEL_NAME = "Qwen3-30B-A3B"
 MODEL_TYPE = "qwen3-30B-A3B"
-NUM_GPUS = 6
-TRAIN_GPUS = 4
+NUM_GPUS = 10
+TRAIN_GPUS = 8
 ENGINE_GPUS = 2
 TEST_ROOT = os.environ.get("HF_HOME") or "/root"
 MODEL_DIR = os.environ.get("MODEL_PATH", f"{TEST_ROOT}/models/{MODEL_NAME}")
@@ -177,8 +177,8 @@ def execute():
             "--apply-chat-template --rollout-shuffle --rm-type deepscaler "
             "--num-rollout 2 --rollout-batch-size 2 --n-samples-per-prompt 4 "
             "--rollout-max-response-len 64 --rollout-temperature 1 --global-batch-size 8 --balance-data "
-            "--tensor-model-parallel-size 2 --sequence-parallel --pipeline-model-parallel-size 2 "
-            "--context-parallel-size 1 --expert-model-parallel-size 1 --expert-tensor-parallel-size 1 "
+            "--tensor-model-parallel-size 4 --sequence-parallel --pipeline-model-parallel-size 1 "
+            "--context-parallel-size 1 --expert-model-parallel-size 8 --expert-tensor-parallel-size 1 "
             "--moe-token-dispatcher-type alltoall --recompute-granularity full --recompute-method uniform "
             "--recompute-num-layers 1 --use-dynamic-batch-size --max-tokens-per-gpu 8192 --micro-batch-size 1 "
             "--advantage-estimator grpo --use-kl-loss --kl-loss-coef 0.00 --kl-loss-type low_var_kl "
@@ -186,7 +186,7 @@ def execute():
             "--optimizer adam --lr 1e-6 --lr-decay-style constant --weight-decay 0.1 "
             "--adam-beta1 0.9 --adam-beta2 0.98 --optimizer-cpu-offload --overlap-cpu-optimizer-d2h-h2d "
             "--use-precision-aware-optimizer --rollout-num-gpus-per-engine 2 --vllm-enable-expert-parallel "
-            "--vllm-expert-placement-strategy linear --vllm-gpu-memory-utilization 0.6 --vllm-enforce-eager "
+            "--vllm-gpu-memory-utilization 0.6 --vllm-enforce-eager "
             "--vllm-additional-config '{\"weight_nz_mode\":0}' "
             "--update-weight-mode delta --update-weight-transport disk "
             f"--update-weight-disk-dir {shlex.quote(str(case_dir / 'published'))} "
@@ -195,22 +195,22 @@ def execute():
             "--update-weight-disk-keep-files --attention-dropout 0.0 --hidden-dropout 0.0 "
             "--accumulate-allreduce-grads-in-fp32 --attention-softmax-in-fp32 --attention-backend flash "
             "--use-flash-attn --no-gradient-accumulation-fusion --train-backend megatron "
-            "--actor-num-nodes 1 --actor-num-gpus-per-node 4 --rollout-num-gpus 2 --ci-test "
+            "--actor-num-nodes 1 --actor-num-gpus-per-node 8 --rollout-num-gpus 2 --ci-test "
         )
+        extra_env_vars = {
+            "DISK_DELTA_RESULT_DIR": str(case_dir),
+            "DISK_DELTA_BASELINE_PROMPT": BASELINE_PROMPT,
+            "DISK_DELTA_BASELINE_TOKENS": os.environ.get("DISK_DELTA_BASELINE_TOKENS", "64"),
+            "DISK_DELTA_ENCODING": encoding,
+        }
+        if "ASCEND_RT_VISIBLE_DEVICES" in os.environ:
+            extra_env_vars["ASCEND_RT_VISIBLE_DEVICES"] = os.environ["ASCEND_RT_VISIBLE_DEVICES"]
         U.execute_train(
             train_args=train_args,
             num_gpus_per_node=NUM_GPUS,
             megatron_model_type=MODEL_TYPE,
             train_script=f"tests/{Path(__file__).name} --e2e-worker",
-            extra_env_vars={
-                "DISK_DELTA_RESULT_DIR": str(case_dir),
-                "DISK_DELTA_BASELINE_PROMPT": BASELINE_PROMPT,
-                "DISK_DELTA_BASELINE_TOKENS": os.environ.get("DISK_DELTA_BASELINE_TOKENS", "64"),
-                "DISK_DELTA_ENCODING": encoding,
-                "ASCEND_RT_VISIBLE_DEVICES": os.environ.get(
-                    "ASCEND_RT_VISIBLE_DEVICES", ",".join(str(device) for device in range(NUM_GPUS))
-                ),
-            },
+            extra_env_vars=extra_env_vars,
         )
         metrics_path = case_dir / "round-metrics.json"
         if not metrics_path.is_file():
@@ -278,7 +278,7 @@ def run_e2e(args):
         or args.rollout_num_gpus != ENGINE_GPUS
         or args.rollout_num_gpus_per_engine != ENGINE_GPUS
     ):
-        raise ValueError("Use two rollouts on four training plus two serving NPUs")
+        raise ValueError("Use two rollouts with eight training and two serving NPUs")
 
     tokenizer = AutoTokenizer.from_pretrained(args.hf_checkpoint, trust_remote_code=True)
     prompt_ids = tokenizer.apply_chat_template(
