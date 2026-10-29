@@ -51,20 +51,25 @@ delta 始终用 zstd（level 1）压缩；profiling 显示对这类数据它在 
 
 ### Sparse HCCL
 
-1. 通过 Megatron-Bridge 建立导出索引。首轮全量也使用
-   `HfWeightIteratorBridge`，sparse 路径不调用直接映射导出器。
-2. 为首轮实际训练权重生成完整 int32 checkpoint 坐标与目标值，按字节预算分片，
-   使用`send_weight_chunk` 发送。重连后也能覆盖旧 worker 状态，不假定其
-   仍等于初始 checkpoint。接收端仍需完整形状 NaN staging，首轮 wire 大于 dense 值传输。
-3. 首轮成功后才捕获本地 shard snapshot。后续 bitwise diff 通过真实 Bridge 映射及
-   NaN probe 生成最终 checkpoint 坐标，再按一致目录执行变长 gather 到 rank0。
-4. VIME 在通信前检查边界、重复索引及 NaN，并将 tensor 转到 communicator device
-   且连续；sender 负责 patch 结构检查、metadata 和并发接收 RPC/broadcast；
-   VIME 管理 pause/start/finish/resume。
-5. 接收端通过临时 checkpoint-compatible MoE 视图调用模型 loader，处理 TP/EP
-   放置；不启用 Ascend MoE 直写。values 是目标值覆盖，零也必须写，不是加法 delta。
-6. 显式限制单个 checkpoint tensor 元素数小于 `2**31`，规避当前 checkpoint loader 的
-   int32 大张量边界限制。wire 仍为 int32；输入校验和独立正确性 oracle 保留。
+首轮或重连时执行 Seed，后续更新执行 Diff；两条路径共用 Prepare、Publish、Apply 和 Finish。
+
+1. **Prepare。** 每次更新先暂停 rollout 生成、清理缓存并开启权重更新会话。
+   训练端通过 Megatron-Bridge 准备导出索引，确定训练分片与 HF checkpoint 权重的对应关系。
+2. **Seed。** 首轮或重连后，通过 Bridge 完整导出当前训练权重，生成全部 checkpoint
+   坐标与目标值，交给 Publish／Apply 阶段发送和应用。首轮成功后保存本地 shard snapshot，
+   作为后续差分基准；重连时重新全量覆盖 worker 权重。
+3. **Diff。** 后续更新对当前训练分片与 snapshot 做 bitwise diff，通过 Bridge 映射及
+   NaN probe 转为 HF checkpoint 坐标和值，只保留发生变化的位置。
+4. **Publish。** 对 Diff 生成的变化项，先按一致目录执行变长 gather，聚合到 rank0。
+   rank0 对 Seed 或 Diff 的 payload 检查边界、重复索引和 NaN，转到通信设备并连续化，按字节预算分片。
+   sender 通过 `send_weight_chunk` 发布 metadata，并发启动接收 RPC 与 HCCL broadcast。
+5. **Apply。** rollout worker 接收坐标和值，通过 checkpoint-compatible MoE 视图调用
+   模型原生 loader，完成 TP/EP 放置并原地覆盖对应权重。values 是目标值，包含零值，
+   而不是需要累加的差值。
+6. **Finish。** 全部权重应用成功后，完成更新会话、记录新权重版本，再恢复 rollout 生成。
+
+wire 索引使用 int32，单个 checkpoint tensor 的元素数必须小于 `2**31`。
+接收端需要完整形状的 NaN staging；首轮 Seed 同时传输索引和值，wire 大于仅发送值的 dense 传输。
 
 两份依赖 patch 必须配套安装。Sparse HCCL 采用 unpacked 传输。
 训练环境需安装 Megatron-Bridge。

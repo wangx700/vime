@@ -61,25 +61,34 @@ Deltas are always zstd-compressed (level 1); profiling showed it dominates lz4 /
 
 ### Sparse HCCL
 
-1. Build the export index using Megatron-Bridge. First-sync full exports also use
-   `HfWeightIteratorBridge`; this sparse path does not call the direct exporter.
-2. Represent every initial checkpoint position as an int32 index and target value,
-   split by the wire byte budget, and call `send_weight_chunk`. This seeds
-   actual training weights even after reconnecting to previously modified workers.
-   It requires full-shape NaN staging on the receiver and costs more wire
-   bytes than a dense values-only seed.
-3. Capture local shard snapshots only after successful initialization. Later syncs
-   use bitwise diff and the real Bridge mappings with NaN probes to produce final
-   checkpoint coordinates. Ordered variable-length gather merges them on rank zero.
-4. VIME normalizes device and contiguity and checks bounds, duplicate indices
-   and NaNs. The sender checks patch structure and owns metadata and the
-   concurrent receive RPC/broadcast; VIME owns pause/start/finish/resume.
-5. The receiver uses temporary checkpoint-compatible MoE views and the model's
-   original loader for TP/EP placement. There is no Ascend MoE direct-write path.
-   Values replace positions, including zero; they are not additive deltas.
-6. The checkpoint loader's int32 boundary restriction is enforced explicitly:
-   each checkpoint tensor must contain fewer than `2**31` elements. Wire indices
-   remain int32. Input validation and dedicated correctness oracles stay enabled.
+Initial and reconnected updates use Seed; subsequent updates use Diff.
+Both paths share Prepare, Publish, Apply and Finish.
+
+1. **Prepare.** Pause rollout generation, flush caches and start a weight update
+   session. The trainer uses Megatron-Bridge to prepare an export index mapping
+   training shards to HF checkpoint weights.
+2. **Seed.** On the first update or after reconnection, export all current training
+   weights through Bridge and produce complete checkpoint coordinates and target
+   values for Publish/Apply. After successful seeding, capture local shard snapshots
+   as the baseline for later diffs. Reconnection fully overwrites worker weights.
+3. **Diff.** On later updates, compare current training shards with their snapshots
+   bitwise. Bridge mappings and NaN probes convert changed positions and values
+   into HF checkpoint coordinates.
+4. **Publish.** For Diff entries, first gather variable-length payloads to rank zero
+   in a consistent directory order. For either Seed or Diff, rank zero validates
+   bounds, duplicate indices and NaNs, normalizes device and
+   contiguity, and splits payloads by the byte budget. The sender publishes metadata
+   through `send_weight_chunk` and runs receive RPCs and HCCL broadcasts concurrently.
+5. **Apply.** Rollout workers receive coordinates and values, then use checkpoint-compatible
+   MoE views and the model's native loader for TP/EP placement. Values overwrite
+   the corresponding weights in place, including zeros; they are target values,
+   not additive differences.
+6. **Finish.** After all weights are applied successfully, finish the update session,
+   record the new weight version and resume rollout generation.
+
+Wire indices are int32; each checkpoint tensor must contain fewer than `2**31`
+elements. The receiver requires full-shape NaN staging. Seed sends both indices
+and values, so it uses more wire bytes than a dense values-only transfer.
 
 Both dependency patches must be installed together. Sparse transport is unpacked.
 
