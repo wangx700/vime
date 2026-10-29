@@ -42,15 +42,15 @@ from vllm.model_executor.model_loader.checkpoint_weight_patch import (
 )
 
 import vime.backends.megatron_utils  # noqa: F401 - Bootstrap NPU before importing Megatron.
-from vime.backends.megatron_utils.update_weight import megatron_delta_export
-from vime.backends.megatron_utils.update_weight import sparse_gather as gather_module
-from vime.backends.megatron_utils.update_weight import update_weight_from_sparse_hccl as updater_module
-from vime.backends.megatron_utils.update_weight.megatron_delta_export import (
+from vime.backends.megatron_utils.delta_sync import megatron_delta_export
+from vime.backends.megatron_utils.delta_sync import sparse_gather as gather_module
+from vime.backends.megatron_utils.delta_sync.megatron_delta_export import (
     _device_shard,
     compact_shard_masks,
     shard_delta_mask,
 )
-from vime.backends.megatron_utils.update_weight.sparse_gather import GatherWorkspace, gather_slot_entries_to_rank0
+from vime.backends.megatron_utils.delta_sync.sparse_gather import GatherWorkspace, gather_slot_entries_to_rank0
+from vime.backends.megatron_utils.update_weight import update_weight_from_sparse_hccl as updater_module
 
 TP = 2
 PP = 2
@@ -91,14 +91,14 @@ def _compare_sparse_with_full_weights(model, cfg_dir, rank):
     """Require sparse reconstruction to equal full export, including untouched weights."""
     from types import SimpleNamespace
 
-    from vime.backends.megatron_utils.update_weight.hf_weight_iterator_bridge import HfWeightIteratorBridge
-    from vime.backends.megatron_utils.update_weight.megatron_delta_export import (
+    from vime.backends.megatron_utils.delta_sync.hf_weight_iterator_bridge import HfWeightIteratorBridge
+    from vime.backends.megatron_utils.delta_sync.megatron_delta_export import (
         build_export_index,
         iter_delta_entries,
         prime_delta_snapshots,
         validate_export_weights,
     )
-    from vime.backends.megatron_utils.update_weight.sparse_gather import _GatherQueue
+    from vime.backends.megatron_utils.delta_sync.sparse_gather import _GatherQueue
 
     iterator = HfWeightIteratorBridge(SimpleNamespace(hf_checkpoint=cfg_dir, update_weight_buffer_size=4096), model)
     with iterator.model_context():
@@ -169,7 +169,7 @@ def _run_sparse_full_comparison(rank, cfg_dir):
 
     from megatron.bridge import AutoBridge
 
-    from vime.backends.megatron_utils.update_weight.hf_weight_iterator_bridge import configure_bridge_module_types
+    from vime.backends.megatron_utils.delta_sync.hf_weight_iterator_bridge import configure_bridge_module_types
 
     configure_bridge_module_types()
     bridge = AutoBridge.from_hf_pretrained(cfg_dir, trust_remote_code=True)

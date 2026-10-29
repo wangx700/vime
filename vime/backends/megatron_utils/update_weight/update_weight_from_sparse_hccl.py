@@ -20,15 +20,15 @@ from vllm_ascend.distributed.weight_transfer.sparse_hccl_engine import (
 
 from vime.utils.distributed_utils import get_gloo_group
 
-from .common import VimeRayWeightSyncClient
-from .hf_weight_iterator_bridge import HfWeightIteratorBridge
-from .megatron_delta_export import (
+from ..delta_sync.hf_weight_iterator_bridge import HfWeightIteratorBridge
+from ..delta_sync.megatron_delta_export import (
     build_export_index,
     iter_delta_entries,
     prime_delta_snapshots,
     validate_export_weights,
 )
-from .sparse_gather import _GatherQueue
+from ..delta_sync.sparse_gather import _GatherQueue
+from .common import VimeRayWeightSyncClient
 
 logger = logging.getLogger(__name__)
 
