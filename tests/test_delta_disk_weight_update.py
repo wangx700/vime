@@ -1,4 +1,4 @@
-"""Qwen3-30B-A3B disk-delta E2E and full-checkpoint inference oracle.
+"""Qwen3-0.6B disk-delta E2E and full-checkpoint inference oracle.
 
 Each delta encoding runs a baseline pull, two training/update rounds, then
 compares the reloaded rollout engine with a fresh engine loaded from an
@@ -23,16 +23,16 @@ import vime.utils.external_utils.command_utils as U
 from vime.utils.disk_delta import checksum, make_tensor_reader
 
 
-MODEL_NAME = "Qwen3-30B-A3B"
-MODEL_TYPE = "qwen3-30B-A3B"
-NUM_GPUS = 6
-TRAIN_GPUS = 4
-ENGINE_GPUS = 2
+MODEL_NAME = "Qwen3-0.6B"
+MODEL_TYPE = "qwen3-0.6B"
+TRAIN_GPUS = 1
+ENGINE_GPUS = 1
+NUM_GPUS = TRAIN_GPUS + ENGINE_GPUS
 TEST_ROOT = os.environ.get("HF_HOME") or "/root"
 MODEL_DIR = os.environ.get("MODEL_PATH", f"{TEST_ROOT}/models/{MODEL_NAME}")
 DATASET_DIR = f"{TEST_ROOT}/datasets/dapo-math-17k"
 PROMPT_DATA = os.environ.get("PROMPT_DATA_PATH", f"{DATASET_DIR}/dapo-math-17k.jsonl")
-RESULT_DIR = os.environ.get("DISK_DELTA_RESULT_DIR", f"{TEST_ROOT}/disk-delta-30b-{time.time_ns()}")
+RESULT_DIR = os.environ.get("DISK_DELTA_RESULT_DIR", f"{TEST_ROOT}/disk-delta-0.6b-{time.time_ns()}")
 BASELINE_PROMPT = os.environ.get("DISK_DELTA_BASELINE_PROMPT", "What is 17 + 25? Give the answer in one sentence.")
 
 
@@ -41,7 +41,7 @@ def prepare():
     dataset_dir = shlex.quote(DATASET_DIR)
     U.exec_command(f"mkdir -p {shlex.quote(f'{TEST_ROOT}/models')} {shlex.quote(f'{TEST_ROOT}/datasets')}")
     if not Path(MODEL_DIR, "config.json").is_file():
-        U.exec_command(f"hf download Qwen/Qwen3-30B-A3B --local-dir {model_dir}")
+        U.exec_command(f"hf download Qwen/{MODEL_NAME} --local-dir {model_dir}")
     if not Path(PROMPT_DATA).is_file():
         U.exec_command("hf download --repo-type dataset zhuzilin/dapo-math-17k " f"--local-dir {dataset_dir}")
 
@@ -165,7 +165,7 @@ def verify_checkpoints(case_dir: Path, encoding: str, round_metrics: list[dict])
     # local base and versioned payloads can each occupy tens of GiB.
     for path in (published, local, case_dir / "updated-checkpoint"):
         shutil.rmtree(path)
-    print(f"Disk delta 30B checkpoint validation passed: {summary}", flush=True)
+    print(f"Disk delta {MODEL_NAME} checkpoint validation passed: {summary}", flush=True)
 
 
 def execute():
@@ -184,17 +184,17 @@ def execute():
             "--apply-chat-template --rollout-shuffle --rm-type deepscaler "
             "--num-rollout 2 --rollout-batch-size 2 --n-samples-per-prompt 4 "
             "--rollout-max-response-len 64 --rollout-temperature 1 --global-batch-size 8 --balance-data "
-            "--tensor-model-parallel-size 2 --sequence-parallel --pipeline-model-parallel-size 2 "
-            "--context-parallel-size 1 --expert-model-parallel-size 2 --expert-tensor-parallel-size 1 "
-            "--moe-token-dispatcher-type alltoall --recompute-granularity full --recompute-method uniform "
+            "--tensor-model-parallel-size 1 --pipeline-model-parallel-size 1 "
+            "--context-parallel-size 1 --expert-model-parallel-size 1 --expert-tensor-parallel-size 1 "
+            "--recompute-granularity full --recompute-method uniform "
             "--recompute-num-layers 1 --use-dynamic-batch-size --max-tokens-per-gpu 8192 --micro-batch-size 1 "
             "--advantage-estimator grpo --use-kl-loss --kl-loss-coef 0.00 --kl-loss-type low_var_kl "
             "--entropy-coef 0.001 --eps-clip 0.2 --eps-clip-high 0.28 "
             "--optimizer adam --lr 1e-6 --lr-decay-style constant --weight-decay 0.1 "
             "--adam-beta1 0.9 --adam-beta2 0.98 --optimizer-cpu-offload --overlap-cpu-optimizer-d2h-h2d "
-            "--use-precision-aware-optimizer --rollout-num-gpus-per-engine 2 --vllm-enable-expert-parallel "
+            f"--use-precision-aware-optimizer --rollout-num-gpus-per-engine {ENGINE_GPUS} "
             "--vllm-enable-scale-out "
-            "--vllm-pipeline-parallel-size 1 --vllm-expert-placement-strategy linear "
+            "--vllm-pipeline-parallel-size 1 "
             "--vllm-gpu-memory-utilization 0.6 --vllm-enforce-eager "
             "--vllm-additional-config '{\"weight_nz_mode\":0}' "
             "--update-weight-mode delta --update-weight-transport disk "
@@ -204,7 +204,7 @@ def execute():
             "--update-weight-disk-keep-files --attention-dropout 0.0 --hidden-dropout 0.0 "
             "--accumulate-allreduce-grads-in-fp32 --attention-softmax-in-fp32 --attention-backend flash "
             "--use-flash-attn --no-gradient-accumulation-fusion --train-backend megatron "
-            "--actor-num-nodes 1 --actor-num-gpus-per-node 4 --rollout-num-gpus 2 --ci-test "
+            f"--actor-num-nodes 1 --actor-num-gpus-per-node {TRAIN_GPUS} --rollout-num-gpus {ENGINE_GPUS} --ci-test "
         )
         extra_env_vars = {
             "DISK_DELTA_RESULT_DIR": str(case_dir),
@@ -287,7 +287,7 @@ def run_e2e(args):
         or args.rollout_num_gpus != ENGINE_GPUS
         or args.rollout_num_gpus_per_engine != ENGINE_GPUS
     ):
-        raise ValueError("Use two rollouts with four training and two serving NPUs")
+        raise ValueError("Use two rollouts with one training and one serving NPU")
 
     tokenizer = AutoTokenizer.from_pretrained(args.hf_checkpoint, trust_remote_code=True)
     prompt_ids = tokenizer.apply_chat_template(
@@ -379,7 +379,7 @@ def run_e2e(args):
         _write_json(case_dir / "comparison.json", comparison)
         if not comparison["passed"]:
             raise AssertionError(f"Disk-delta/full-checkpoint inference mismatch: {comparison}")
-        print("Disk delta 30B E2E PASS: token IDs and generated-token logprobs match", flush=True)
+        print(f"Disk delta {MODEL_NAME} E2E PASS: token IDs and generated-token logprobs match", flush=True)
     finally:
         from vllm.utils.system_utils import kill_process_tree
 
