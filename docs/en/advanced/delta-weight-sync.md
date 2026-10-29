@@ -26,8 +26,6 @@ PP=1, with EPLB disabled. Configure `--vllm-pipeline-parallel-size 1`.
 The receiver handles TP/DP/EP loading; inference PP>1 is rejected before
 communication initialization. Training-side PP/TP/EP export remains supported.
 
-Sparse export requires Megatron-Bridge in the training environment.
-
 The script `scripts/run-qwen3-30B-A3B-sparse-hccl.sh` uses training
 TP2/PP2/EP2 and rollout TP2/PP1/EP2, on four training plus two rollout NPUs.
 Set `DATA_ROOT` to the directory containing `weights/` and `datasets/`, and load
@@ -62,35 +60,28 @@ Deltas are always zstd-compressed (level 1); profiling showed it dominates lz4 /
 ### Sparse HCCL
 
 Initial and reconnected updates use Seed; subsequent updates use Diff.
-Both paths share Prepare, Publish, Apply and Finish.
+Both paths share Publish and Apply.
 
-1. **Prepare.** Pause rollout generation, flush caches and start a weight update
-   session. The trainer uses Megatron-Bridge to prepare an export index mapping
-   training shards to HF checkpoint weights.
-2. **Seed.** On the first update or after reconnection, export all current training
+1. **Seed.** On the first update or after reconnection, export all current training
    weights through Bridge and produce complete checkpoint coordinates and target
    values for Publish/Apply. After successful seeding, capture local shard snapshots
    as the baseline for later diffs. Reconnection fully overwrites worker weights.
-3. **Diff.** On later updates, compare current training shards with their snapshots
+2. **Diff.** On later updates, compare current training shards with their snapshots
    bitwise. Bridge mappings and NaN probes convert changed positions and values
    into HF checkpoint coordinates.
-4. **Publish.** For Diff entries, first gather variable-length payloads to rank zero
+3. **Publish.** For Diff entries, first gather variable-length payloads to rank zero
    in a consistent directory order. For either Seed or Diff, rank zero validates
    bounds, duplicate indices and NaNs, normalizes device and
    contiguity, and splits payloads by the byte budget. The sender publishes metadata
    through `send_weight_chunk` and runs receive RPCs and HCCL broadcasts concurrently.
-5. **Apply.** Rollout workers receive coordinates and values, then use checkpoint-compatible
+4. **Apply.** Rollout workers receive coordinates and values, then use checkpoint-compatible
    MoE views and the model's native loader for TP/EP placement. Values overwrite
    the corresponding weights in place, including zeros; they are target values,
    not additive differences.
-6. **Finish.** After all weights are applied successfully, finish the update session,
-   record the new weight version and resume rollout generation.
 
 Wire indices are int32; each checkpoint tensor must contain fewer than `2**31`
 elements. The receiver requires full-shape NaN staging. Seed sends both indices
 and values, so it uses more wire bytes than a dense values-only transfer.
-
-Both dependency patches must be installed together. Sparse transport is unpacked.
 
 ### Disk transport
 
