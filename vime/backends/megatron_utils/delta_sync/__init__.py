@@ -1,1 +1,1 @@
-"""Weight export, delta conversion and gather helpers for delta-weight-sync."""
+"""Weight export, delta conversion and gather helpers for delta weight synchronization."""
