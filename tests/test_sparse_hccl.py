@@ -91,9 +91,7 @@ def _compare_sparse_with_full_weights(model, cfg_dir, rank):
     """Require sparse reconstruction to equal full export, including untouched weights."""
     from types import SimpleNamespace
 
-    from vime.backends.megatron_utils.update_weight.hf_weight_iterator_bridge import (
-        HfWeightIteratorBridge,
-    )
+    from vime.backends.megatron_utils.update_weight.hf_weight_iterator_bridge import HfWeightIteratorBridge
     from vime.backends.megatron_utils.update_weight.megatron_delta_export import (
         build_export_index,
         iter_delta_entries,
@@ -171,9 +169,7 @@ def _run_sparse_full_comparison(rank, cfg_dir):
 
     from megatron.bridge import AutoBridge
 
-    from vime.backends.megatron_utils.update_weight.hf_weight_iterator_bridge import (
-        configure_bridge_module_types,
-    )
+    from vime.backends.megatron_utils.update_weight.hf_weight_iterator_bridge import configure_bridge_module_types
 
     configure_bridge_module_types()
     bridge = AutoBridge.from_hf_pretrained(cfg_dir, trust_remote_code=True)
