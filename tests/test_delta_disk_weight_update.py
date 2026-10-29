@@ -186,6 +186,7 @@ def execute():
             "--optimizer adam --lr 1e-6 --lr-decay-style constant --weight-decay 0.1 "
             "--adam-beta1 0.9 --adam-beta2 0.98 --optimizer-cpu-offload --overlap-cpu-optimizer-d2h-h2d "
             "--use-precision-aware-optimizer --rollout-num-gpus-per-engine 2 --vllm-enable-expert-parallel "
+            "--vllm-enable-scale-out "
             "--vllm-gpu-memory-utilization 0.6 --vllm-enforce-eager "
             "--vllm-additional-config '{\"weight_nz_mode\":0}' "
             "--update-weight-mode delta --update-weight-transport disk "
