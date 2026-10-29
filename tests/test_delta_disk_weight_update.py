@@ -251,33 +251,107 @@ def execute():
     for encoding in ("xor", "overwrite"):
         case_dir = output / encoding
         case_dir.mkdir()
-        train_args = (
-            f"--hf-checkpoint {model_dir} --load {model_dir} --ref-load {model_dir} --no-load-optim "
-            f"--prompt-data {shlex.quote(prompt_data)} --input-key prompt --label-key label "
-            "--apply-chat-template --rollout-shuffle --rm-type deepscaler "
-            "--num-rollout 2 --rollout-batch-size 2 --n-samples-per-prompt 4 "
-            "--rollout-max-response-len 64 --rollout-temperature 1 --global-batch-size 8 --balance-data "
-            "--tensor-model-parallel-size 1 --pipeline-model-parallel-size 1 "
-            "--context-parallel-size 1 --expert-model-parallel-size 1 --expert-tensor-parallel-size 1 "
-            "--recompute-granularity full --recompute-method uniform "
-            "--recompute-num-layers 1 --use-dynamic-batch-size --max-tokens-per-gpu 8192 --micro-batch-size 1 "
-            "--advantage-estimator grpo --use-kl-loss --kl-loss-coef 0.00 --kl-loss-type low_var_kl "
-            "--entropy-coef 0.001 --eps-clip 0.2 --eps-clip-high 0.28 "
-            "--optimizer adam --lr 1e-6 --lr-decay-style constant --weight-decay 0.1 "
-            "--adam-beta1 0.9 --adam-beta2 0.98 --optimizer-cpu-offload --overlap-cpu-optimizer-d2h-h2d "
-            f"--use-precision-aware-optimizer --rollout-num-gpus-per-engine {ENGINE_GPUS} "
+        ckpt_args = (
+            f"--hf-checkpoint {model_dir} " f"--load {model_dir} " f"--ref-load {model_dir} " "--no-load-optim "
+        )
+
+        rollout_args = (
+            f"--prompt-data {shlex.quote(prompt_data)} "
+            "--input-key prompt "
+            "--label-key label "
+            "--apply-chat-template "
+            "--rollout-shuffle "
+            "--rm-type deepscaler "
+            "--num-rollout 2 "
+            "--rollout-batch-size 2 "
+            "--n-samples-per-prompt 4 "
+            "--rollout-max-response-len 64 "
+            "--rollout-temperature 1 "
+            "--global-batch-size 8 "
+            "--balance-data "
+        )
+
+        perf_args = (
+            "--tensor-model-parallel-size 1 "
+            "--pipeline-model-parallel-size 1 "
+            "--context-parallel-size 1 "
+            "--expert-model-parallel-size 1 "
+            "--expert-tensor-parallel-size 1 "
+            "--recompute-granularity full "
+            "--recompute-method uniform "
+            "--recompute-num-layers 1 "
+            "--use-dynamic-batch-size "
+            "--max-tokens-per-gpu 8192 "
+            "--micro-batch-size 1 "
+        )
+
+        grpo_args = (
+            "--advantage-estimator grpo "
+            "--use-kl-loss "
+            "--kl-loss-coef 0.00 "
+            "--kl-loss-type low_var_kl "
+            "--entropy-coef 0.001 "
+            "--eps-clip 0.2 "
+            "--eps-clip-high 0.28 "
+        )
+
+        optimizer_args = (
+            "--optimizer adam "
+            "--lr 1e-6 "
+            "--lr-decay-style constant "
+            "--weight-decay 0.1 "
+            "--adam-beta1 0.9 "
+            "--adam-beta2 0.98 "
+            "--optimizer-cpu-offload "
+            "--overlap-cpu-optimizer-d2h-h2d "
+            "--use-precision-aware-optimizer "
+        )
+
+        vllm_args = (
+            f"--rollout-num-gpus-per-engine {ENGINE_GPUS} "
+            f"--rollout-num-gpus {ENGINE_GPUS} "
             "--vllm-enable-scale-out "
             "--vllm-pipeline-parallel-size 1 "
-            "--vllm-gpu-memory-utilization 0.6 --vllm-enforce-eager "
+            "--vllm-gpu-memory-utilization 0.6 "
+            "--vllm-enforce-eager "
             "--vllm-additional-config '{\"weight_nz_mode\":0}' "
-            "--update-weight-mode delta --update-weight-transport disk "
+        )
+
+        disk_update_args = (
+            "--update-weight-mode delta "
+            "--update-weight-transport disk "
             f"--update-weight-disk-dir {shlex.quote(str(case_dir / 'published'))} "
             f"--update-weight-local-checkpoint-dir {shlex.quote(str(case_dir / 'local'))} "
-            f"--update-weight-delta-encoding {encoding} --update-weight-delta-checksum adler32 "
-            "--update-weight-disk-keep-files --attention-dropout 0.0 --hidden-dropout 0.0 "
-            "--accumulate-allreduce-grads-in-fp32 --attention-softmax-in-fp32 --attention-backend flash "
-            "--use-flash-attn --no-gradient-accumulation-fusion --train-backend megatron "
-            f"--actor-num-nodes 1 --actor-num-gpus-per-node {TRAIN_GPUS} --rollout-num-gpus {ENGINE_GPUS} --ci-test "
+            f"--update-weight-delta-encoding {encoding} "
+            "--update-weight-delta-checksum adler32 "
+            "--update-weight-disk-keep-files "
+        )
+
+        ci_args = "--ci-test "
+
+        misc_args = (
+            "--attention-dropout 0.0 "
+            "--hidden-dropout 0.0 "
+            "--accumulate-allreduce-grads-in-fp32 "
+            "--attention-softmax-in-fp32 "
+            "--attention-backend flash "
+            "--use-flash-attn "
+            "--no-gradient-accumulation-fusion "
+            "--train-backend megatron "
+            "--actor-num-nodes 1 "
+            f"--actor-num-gpus-per-node {TRAIN_GPUS} "
+        )
+
+        train_args = (
+            f"{ckpt_args} "
+            f"{rollout_args} "
+            f"{optimizer_args} "
+            f"{grpo_args} "
+            f"{perf_args} "
+            f"{vllm_args} "
+            f"{disk_update_args} "
+            f"{ci_args} "
+            f"{misc_args} "
         )
         extra_env_vars = {
             "DISK_DELTA_RESULT_DIR": str(case_dir),
