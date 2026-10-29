@@ -92,26 +92,6 @@ and values, so it uses more wire bytes than a dense values-only transfer.
 
 Both dependency patches must be installed together. Sparse transport is unpacked.
 
-### End-to-end checkpoint comparison
-
-`tests/test_qwen3_30B_A3B_sparse_hccl_npu.py` trains on four NPUs, performs a
-complete seed and nonempty sparse updates into a two-NPU rollout engine, and
-exports the final training weights as a full HF checkpoint through Bridge.
-It captures greedy inference, stops the rollout engine, and launches a fresh
-engine on the same two devices to load that checkpoint directly from disk.
-Both engines receive the same prompt token IDs and sampling parameters.
-Generated token IDs and every logprob must match exactly; a missing logprob,
-non-finite value or any mismatch fails the run. Repeat inference checks
-whether the updated engine is itself exactly repeatable first.
-
-```bash
-MODEL_PATH=/mnt/weight/Qwen3-30B-A3B \
-PROMPT_DATA_PATH=/path/to/dapo-math-17k.jsonl \
-SPARSE_HCCL_RESULT_DIR=/local/nvme/sparse-check-001 \
-SPARSE_HCCL_BASELINE_PROMPT="What is 17 + 25? Give the answer in one sentence." \
-python tests/test_qwen3_30B_A3B_sparse_hccl_npu.py
-```
-
 ### Disk transport
 
 1. **Seed.** On the first sync the trainer captures a CPU snapshot of every parameter — seeded

@@ -74,23 +74,6 @@ wire 索引使用 int32，单个 checkpoint tensor 的元素数必须小于 `2**
 两份依赖 patch 必须配套安装。Sparse HCCL 采用 unpacked 传输。
 训练环境需安装 Megatron-Bridge。
 
-### 端到端权重与推理对照
-
-`tests/test_qwen3_30B_A3B_sparse_hccl_npu.py` 在四张卡上训练，向两张推理卡
-执行完整 seed 和非空 sparse delta；随后从最终训练模型经 Bridge 完整导出 HF
-checkpoint。它记录 sparse 更新后的 greedy 推理结果，关闭该推理进程，再在相同两张卡
-启动全新推理进程，直接加载导出的本地 checkpoint。两路使用完全相同的 prompt token IDs
-和采样参数，要求生成 token IDs 和每个 token 的 logprob 严格相等；缺失、非有限值或
-任意差异均失败。对照前也会重复推理一次，检查更新后的模型自身是否可精确复现。
-
-```bash
-MODEL_PATH=/mnt/weight/Qwen3-30B-A3B \
-PROMPT_DATA_PATH=/path/to/dapo-math-17k.jsonl \
-SPARSE_HCCL_RESULT_DIR=/local/nvme/sparse-check-001 \
-SPARSE_HCCL_BASELINE_PROMPT="What is 17 + 25? Give the answer in one sentence." \
-python tests/test_qwen3_30B_A3B_sparse_hccl_npu.py
-```
-
 ### 磁盘传输
 
 1. **Seed。** 第一次同步时，训练端为每个参数捕获一份 CPU snapshot——从 `--hf-checkpoint` seed，而这正是每个 rollout host 物化本地 checkpoint 的来源。此次不发布任何东西；这份 snapshot 就是下一次同步 diff 的基准。训练端同时发出 `target_version=0` 的 `/pull_weights`，让每个 host 现在就物化本地 base，与 snapshot 捕获重叠进行。
