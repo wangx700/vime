@@ -25,8 +25,8 @@ from vime.utils.disk_delta import checksum, make_tensor_reader
 
 MODEL_NAME = "Qwen3-30B-A3B"
 MODEL_TYPE = "qwen3-30B-A3B"
-NUM_GPUS = 10
-TRAIN_GPUS = 8
+NUM_GPUS = 6
+TRAIN_GPUS = 4
 ENGINE_GPUS = 2
 TEST_ROOT = os.environ.get("HF_HOME") or "/root"
 MODEL_DIR = os.environ.get("MODEL_PATH", f"{TEST_ROOT}/models/{MODEL_NAME}")
@@ -96,6 +96,12 @@ def _compare(actual, expected):
 
 
 def verify_checkpoints(case_dir: Path, encoding: str, round_metrics: list[dict]):
+    comparison_path = case_dir / "comparison.json"
+    assert comparison_path.is_file(), f"Missing fresh-checkpoint inference comparison: {comparison_path}"
+    inference_comparison = json.loads(comparison_path.read_text())
+    assert inference_comparison.get("passed") is True, inference_comparison
+    assert inference_comparison.get("max_abs_logprob_error") == 0.0, inference_comparison
+
     published = case_dir / "published"
     local = case_dir / "local"
     indexes = []
@@ -152,6 +158,7 @@ def verify_checkpoints(case_dir: Path, encoding: str, round_metrics: list[dict])
         "checked_delta_tensors": checked_delta_tensors,
         "checked_full_checkpoint_tensors": checked_full_tensors,
         "full_checkpoint_byte_match": True,
+        "inference_comparison": inference_comparison,
     }
     _write_json(case_dir / "validation.json", summary)
     # Keep the compact functional evidence; the independent full checkpoint,
@@ -177,8 +184,8 @@ def execute():
             "--apply-chat-template --rollout-shuffle --rm-type deepscaler "
             "--num-rollout 2 --rollout-batch-size 2 --n-samples-per-prompt 4 "
             "--rollout-max-response-len 64 --rollout-temperature 1 --global-batch-size 8 --balance-data "
-            "--tensor-model-parallel-size 4 --sequence-parallel --pipeline-model-parallel-size 1 "
-            "--context-parallel-size 1 --expert-model-parallel-size 8 --expert-tensor-parallel-size 1 "
+            "--tensor-model-parallel-size 2 --sequence-parallel --pipeline-model-parallel-size 2 "
+            "--context-parallel-size 1 --expert-model-parallel-size 2 --expert-tensor-parallel-size 1 "
             "--moe-token-dispatcher-type alltoall --recompute-granularity full --recompute-method uniform "
             "--recompute-num-layers 1 --use-dynamic-batch-size --max-tokens-per-gpu 8192 --micro-batch-size 1 "
             "--advantage-estimator grpo --use-kl-loss --kl-loss-coef 0.00 --kl-loss-type low_var_kl "
@@ -187,6 +194,7 @@ def execute():
             "--adam-beta1 0.9 --adam-beta2 0.98 --optimizer-cpu-offload --overlap-cpu-optimizer-d2h-h2d "
             "--use-precision-aware-optimizer --rollout-num-gpus-per-engine 2 --vllm-enable-expert-parallel "
             "--vllm-enable-scale-out "
+            "--vllm-pipeline-parallel-size 1 --vllm-expert-placement-strategy linear "
             "--vllm-gpu-memory-utilization 0.6 --vllm-enforce-eager "
             "--vllm-additional-config '{\"weight_nz_mode\":0}' "
             "--update-weight-mode delta --update-weight-transport disk "
@@ -196,7 +204,7 @@ def execute():
             "--update-weight-disk-keep-files --attention-dropout 0.0 --hidden-dropout 0.0 "
             "--accumulate-allreduce-grads-in-fp32 --attention-softmax-in-fp32 --attention-backend flash "
             "--use-flash-attn --no-gradient-accumulation-fusion --train-backend megatron "
-            "--actor-num-nodes 1 --actor-num-gpus-per-node 8 --rollout-num-gpus 2 --ci-test "
+            "--actor-num-nodes 1 --actor-num-gpus-per-node 4 --rollout-num-gpus 2 --ci-test "
         )
         extra_env_vars = {
             "DISK_DELTA_RESULT_DIR": str(case_dir),
@@ -279,7 +287,7 @@ def run_e2e(args):
         or args.rollout_num_gpus != ENGINE_GPUS
         or args.rollout_num_gpus_per_engine != ENGINE_GPUS
     ):
-        raise ValueError("Use two rollouts with eight training and two serving NPUs")
+        raise ValueError("Use two rollouts with four training and two serving NPUs")
 
     tokenizer = AutoTokenizer.from_pretrained(args.hf_checkpoint, trust_remote_code=True)
     prompt_ids = tokenizer.apply_chat_template(
