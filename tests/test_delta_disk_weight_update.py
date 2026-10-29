@@ -9,12 +9,14 @@ logprobs must match exactly.
 import copy
 import json
 import math
+import multiprocessing
 import os
 import shlex
 import shutil
 import socket
 import sys
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 from safetensors import safe_open
@@ -58,10 +60,14 @@ def _infer(url, prompt_ids, sampling):
         session.trust_env = False
         models = session.get(f"{url}/v1/models", timeout=30)
         models.raise_for_status()
+        payload = models.json()
+        data = payload.get("data") if isinstance(payload, dict) else None
+        if not isinstance(data, list) or not data or not isinstance(data[0], dict) or not data[0].get("id"):
+            raise AssertionError(f"Invalid model list from {url}/v1/models: {payload!r}")
         response = session.post(
             f"{url}/inference/v1/generate",
             json={
-                "model": models.json()["data"][0]["id"],
+                "model": data[0]["id"],
                 "token_ids": prompt_ids,
                 "sampling_params": sampling,
             },
@@ -82,6 +88,73 @@ def _infer(url, prompt_ids, sampling):
     return {"token_ids": tokens, "logprobs": logprobs, "finish_reason": choice["finish_reason"]}
 
 
+def _serve_reference(kwargs, env, listener):
+    import argparse
+
+    os.environ.update(env)
+    import uvloop
+    from vllm.entrypoints.launchers.cli_args import make_arg_parser, validate_parsed_serve_args
+    from vllm.entrypoints.openai.api_server import run_server_worker
+    from vllm.utils.argparse_utils import FlexibleArgumentParser
+
+    parser = make_arg_parser(FlexibleArgumentParser())
+    args = parser.parse_args(args=[], namespace=argparse.Namespace(**kwargs))
+    args.api_server_count = 1
+    validate_parsed_serve_args(args)
+    uvloop.run(run_server_worker(f"http://{args.host}:{args.port}", listener, args))
+
+
+@contextmanager
+def _reference_server(reference_args):
+    import requests
+    from vllm.utils.system_utils import kill_process_tree
+
+    from vime.backends.vllm_utils.vllm_engine import _build_subprocess_env, _compute_server_args
+
+    # Keep the socket bound throughout spawn and serving; never release and rebind its port.
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        port = listener.getsockname()[1]
+        url = f"http://127.0.0.1:{port}"
+        kwargs, _ = _compute_server_args(
+            reference_args,
+            0,
+            f"127.0.0.1:{port}",
+            "127.0.0.1",
+            port,
+            "regular",
+            None,
+            base_gpu_id=TRAIN_GPUS,
+            num_gpus_per_engine=ENGINE_GPUS,
+        )
+        env = _build_subprocess_env(kwargs)
+        process = multiprocessing.get_context("spawn").Process(
+            target=_serve_reference,
+            args=({k: v for k, v in kwargs.items() if not k.startswith("_")}, env, listener),
+        )
+        try:
+            process.start()
+            deadline = time.monotonic() + 600
+            with requests.Session() as session:
+                session.trust_env = False
+                while True:
+                    if not process.is_alive():
+                        raise RuntimeError(f"Fresh-checkpoint server exited with code {process.exitcode}: {url}")
+                    try:
+                        if session.get(f"{url}/health", timeout=2).status_code == 200:
+                            break
+                    except requests.RequestException:
+                        pass
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError(f"Fresh-checkpoint server did not become healthy: {url}")
+                    time.sleep(1)
+            yield url
+        finally:
+            if process.pid is not None:
+                kill_process_tree(process.pid)
+                process.join(timeout=30)
+
+
 def _compare(actual, expected):
     same_length = len(actual["logprobs"]) == len(expected["logprobs"])
     errors = [abs(a - b) for a, b in zip(actual["logprobs"], expected["logprobs"], strict=False)]
@@ -98,7 +171,7 @@ def _compare(actual, expected):
 def verify_checkpoints(case_dir: Path, encoding: str, round_metrics: list[dict]):
     comparison_path = case_dir / "comparison.json"
     assert comparison_path.is_file(), f"Missing fresh-checkpoint inference comparison: {comparison_path}"
-    inference_comparison = json.loads(comparison_path.read_text())
+    inference_comparison = json.loads(comparison_path.read_text(encoding="utf-8"))
     assert inference_comparison.get("passed") is True, inference_comparison
     assert inference_comparison.get("max_abs_logprob_error") == 0.0, inference_comparison
 
@@ -107,7 +180,7 @@ def verify_checkpoints(case_dir: Path, encoding: str, round_metrics: list[dict])
     indexes = []
     for version in (1, 2):
         path = published / f"weight_v{version:06d}"
-        index = json.loads((path / "model.safetensors.index.json").read_text())
+        index = json.loads((path / "model.safetensors.index.json").read_text(encoding="utf-8"))
         metadata = index["metadata"]
         assert metadata["version"] == f"{version:06d}", metadata
         assert metadata["base_version"] == f"{version - 1:06d}", metadata
@@ -119,7 +192,7 @@ def verify_checkpoints(case_dir: Path, encoding: str, round_metrics: list[dict])
             assert (path / filename).stat().st_size > 0
         indexes.append(index)
 
-    state = json.loads((local / ".weight_sync/state.json").read_text())
+    state = json.loads((local / ".weight_sync/state.json").read_text(encoding="utf-8"))
     assert state == {"version": "000002"}, state
     read_tensor = make_tensor_reader(str(local))
     final_index = indexes[-1]
@@ -139,9 +212,9 @@ def verify_checkpoints(case_dir: Path, encoding: str, round_metrics: list[dict])
     # Bridge-exported final model, covering both changed and unchanged tensors.
     oracle = make_tensor_reader(str(case_dir / "updated-checkpoint"))
     checked_full_tensors = 0
-    for name in json.loads((case_dir / "updated-checkpoint" / "model.safetensors.index.json").read_text())[
-        "weight_map"
-    ]:
+    for name in json.loads(
+        (case_dir / "updated-checkpoint" / "model.safetensors.index.json").read_text(encoding="utf-8")
+    )["weight_map"]:
         actual = read_tensor(name)
         expected = oracle(name)
         assert actual.shape == expected.shape, f"Reconstructed shape mismatch: {name}"
@@ -224,7 +297,7 @@ def execute():
         metrics_path = case_dir / "round-metrics.json"
         if not metrics_path.is_file():
             raise AssertionError(f"Training job completed without writing update metrics: {case_dir}")
-        metrics = json.loads(metrics_path.read_text())
+        metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
         verify_checkpoints(case_dir, encoding, metrics)
 
 
@@ -236,7 +309,6 @@ def run_e2e(args):
 
     from vime.backends.megatron_utils.actor import MegatronTrainRayActor
     from vime.backends.megatron_utils.hf_checkpoint_saver import save_hf_model_to_path
-    from vime.backends.vllm_utils.vllm_engine import _compute_server_args, launch_server_process
     from vime.observability.logging_utils import configure_logger, finish_tracking, init_tracking
     from vime.ray.placement_group import create_placement_groups, create_rollout_manager, create_training_models
     from vime.utils import accelerator
@@ -273,10 +345,9 @@ def run_e2e(args):
                     }
                 )
                 _write_json(case_dir / "round-metrics.json", round_metrics)
-
-        def export_checkpoint(self, destination):
-            save_hf_model_to_path(self.args, destination, self.model)
-            return self.weight_updater.weight_version if dist.get_rank() == 0 else None
+            if updater.weight_version == 2:
+                save_hf_model_to_path(self.args, str(checkpoint), self.model)
+            return updater.weight_version
 
     if args.use_critic or args.offload_train or args.offload_rollout or args.release_train:
         raise ValueError("The full-checkpoint oracle requires one resident actor and rollout engine")
@@ -318,17 +389,18 @@ def run_e2e(args):
 
     configure_logger()
     init_tracking(args)
-    manager = actor = process = None
+    manager = actor = None
     try:
         pgs = create_placement_groups(args)
         manager, _ = create_rollout_manager(args, pgs["rollout"])
         actor, _ = create_training_models(args, pgs, manager, actor_cls=DiskDeltaOracleActor)
         actor.update_weights()  # First disk-delta call materializes the base checkpoint.
+        export_versions = []
         for rollout_id in range(args.start_rollout_id, args.num_rollout):
             data = ray.get(manager.generate.remote(rollout_id))
             ray.get(actor.async_train(rollout_id, data))
             actor.clear_memory()
-            actor.update_weights()
+            export_versions = actor.update_weights()
 
         ray.get(manager.health_monitoring_pause.remote())
         engines, *_ = ray.get(manager.get_updatable_engines_and_lock.remote())
@@ -337,11 +409,8 @@ def run_e2e(args):
         engine = engines[0]
         url = ray.get(engine.get_url.remote())
         version = ray.get(engine.get_weight_version.remote())
-        export_version = ray.get(
-            [worker.export_checkpoint.remote(str(checkpoint)) for worker in actor._actor_handlers]
-        )[0]
-        if str(version) != str(export_version) or str(version) != "2":
-            raise AssertionError(f"Rollout/export version mismatch: serving={version}, export={export_version}")
+        if str(version) != "2" or not export_versions or any(str(v) != "2" for v in export_versions):
+            raise AssertionError(f"Rollout/export version mismatch: serving={version}, export={export_versions}")
 
         ray.get(engine.flush_cache.remote())
         actual = _infer(url, prompt_ids, sampling)
@@ -358,22 +427,8 @@ def run_e2e(args):
 
         reference_args = copy.deepcopy(args)
         reference_args.hf_checkpoint = str(checkpoint)
-        with socket.socket() as reserved:
-            reserved.bind(("127.0.0.1", 0))
-            port = reserved.getsockname()[1]
-        kwargs, _ = _compute_server_args(
-            reference_args,
-            0,
-            f"127.0.0.1:{port}",
-            "127.0.0.1",
-            port,
-            "regular",
-            None,
-            base_gpu_id=TRAIN_GPUS,
-            num_gpus_per_engine=ENGINE_GPUS,
-        )
-        process = launch_server_process(kwargs)
-        expected = _infer(f"http://127.0.0.1:{port}", prompt_ids, sampling)
+        with _reference_server(reference_args) as reference_url:
+            expected = _infer(reference_url, prompt_ids, sampling)
         _write_json(case_dir / "checkpoint-inference.json", expected)
         comparison = {"weight_version": version, **_compare(actual, expected)}
         _write_json(case_dir / "comparison.json", comparison)
@@ -381,11 +436,6 @@ def run_e2e(args):
             raise AssertionError(f"Disk-delta/full-checkpoint inference mismatch: {comparison}")
         print(f"Disk delta {MODEL_NAME} E2E PASS: token IDs and generated-token logprobs match", flush=True)
     finally:
-        from vllm.utils.system_utils import kill_process_tree
-
-        if process is not None:
-            kill_process_tree(process.pid)
-            process.join(timeout=30)
         try:
             if manager is not None:
                 ray.get(manager.dispose.remote())
@@ -405,6 +455,67 @@ def test_exact_inference_comparison():
         ("finish_reason", "stop"),
     ]:
         assert not _compare({**reference, field: changed}, reference)["passed"]
+
+
+def test_infer_rejects_invalid_model_lists(monkeypatch):
+    from unittest.mock import MagicMock
+
+    import pytest
+    import requests
+
+    for payload in ({}, {"data": []}, {"data": {}}, {"data": [None]}, {"data": [{}]}, []):
+        session = MagicMock()
+        session.get.return_value.json.return_value = payload
+        factory = MagicMock()
+        factory.return_value.__enter__.return_value = session
+        monkeypatch.setattr(requests, "Session", factory)
+        with pytest.raises(AssertionError, match="Invalid model list from http://reference/v1/models"):
+            _infer("http://reference", [1], {})
+        session.post.assert_not_called()
+
+
+def test_reference_server_reserves_port_and_cleans_up(monkeypatch):
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    import pytest
+    import requests
+    import vllm.utils.system_utils as system_utils
+
+    from vime.backends.vllm_utils import vllm_engine
+
+    monkeypatch.setattr(vllm_engine, "_compute_server_args", lambda *a, **k: ({"host": a[3], "port": a[4]}, None))
+    monkeypatch.setattr(vllm_engine, "_build_subprocess_env", lambda _: {})
+    for alive in (True, False):
+        process = MagicMock(pid=123, exitcode=1)
+        process.is_alive.return_value = alive
+        factory = MagicMock(return_value=process)
+        monkeypatch.setattr(
+            multiprocessing, "get_context", lambda _, factory=factory: SimpleNamespace(Process=factory)
+        )
+        cleanup = MagicMock()
+        monkeypatch.setattr(system_utils, "kill_process_tree", cleanup)
+        session = MagicMock()
+        session.get.return_value.status_code = 200
+        session_factory = MagicMock()
+        session_factory.return_value.__enter__.return_value = session
+        monkeypatch.setattr(requests, "Session", session_factory)
+        if alive:
+            with _reference_server(SimpleNamespace()) as url:
+                listener = factory.call_args.kwargs["args"][2]
+                address = listener.getsockname()
+                assert url == f"http://{address[0]}:{address[1]}"
+                with socket.socket() as contender, pytest.raises(OSError):
+                    contender.bind(address)
+            with socket.socket() as contender:
+                contender.bind(address)
+        else:
+            with pytest.raises(RuntimeError, match="Fresh-checkpoint server exited with code 1"):
+                with _reference_server(SimpleNamespace()):
+                    pytest.fail("An exited server must not be yielded")
+        cleanup.assert_called_once_with(123)
+        process.join.assert_called_once_with(timeout=30)
+        assert factory.call_args.kwargs["args"][2].fileno() == -1
 
 
 if __name__ == "__main__":
