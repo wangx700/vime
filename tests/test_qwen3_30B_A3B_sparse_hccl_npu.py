@@ -107,7 +107,7 @@ def execute():
         "--vllm-gpu-memory-utilization 0.6 "
         "--vllm-enforce-eager "
         "--vllm-enable-scale-out "
-        "--vllm-additional-config '{\"weight_nz_mode\":0}' "
+        """--vllm-additional-config '{"weight_nz_mode":0}' """
     )
 
     update_weight_args = (
