@@ -368,7 +368,7 @@ def run_e2e(args):
             port,
             "regular",
             None,
-            base_gpu_id=pgs["rollout"][2][0],
+            base_gpu_id=int(pgs["rollout"][2][0]),
         )
         process = launch_server_process(kwargs)
         expected = _infer(f"http://127.0.0.1:{port}", prompt_ids, sampling)
